@@ -1,0 +1,84 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyc
+*$py.class
+*.so
+.Python
+backend/.venv/
+.venv/
+env/
+venv/
+ENV/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+.pytest_cache/
+backend/.pytest_cache/
+
+# Node / Frontend
+node_modules/
+frontend/node_modules/
+frontend/dist/
+frontend/dist-ssr/
+*.local
+
+# Environment & Secrets
+.env
+*.env
+.env.local
+!.env.example
+
+# Database & Storage
+*.sqlite
+*.sqlite3
+*.sqlite-wal
+*.sqlite-shm
+*.db
+*.db-wal
+*.db-shm
+
+storage/cache/
+storage/projects/
+storage/temp/
+storage/media/
+storage/exports/
+
+backend/storage/cache/
+backend/storage/projects/
+backend/storage/temp/
+backend/storage/media/
+backend/storage/exports/
+
+# Scratch & Temporary
+scratch/
+backend/scratch/
+scratch_prompt.txt
+tmp/
+temp/
+
+# Logs
+*.log
+logs/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
