@@ -8774,4 +8774,272 @@ async def test_phase18_05_render_service_extracts_graphics_clips():
             assert job.status in ["queued", "processing", "completed"]
 
 
+# =====================================================================
+# PHASE 19 TESTS: AI Editing Assistant / Prompt-to-Edit
+# =====================================================================
+
+@pytest.mark.asyncio
+async def test_phase19_01_parse_trim_instruction():
+    """Phase 19 Test 01: Assistant parses trim instruction with context awareness."""
+    from app.services.ai_editing_assistant import AIEditingAssistant
+    from app.schemas.ai_schemas import EditPlanRequest, EditOperationType
+
+    timeline_context = {
+        "tracks": [
+            {
+                "id": "t_v1",
+                "name": "Video 1",
+                "track_type": "video",
+                "clips": [
+                    {"id": "clip_001", "name": "Opening_Shot.mp4", "start_time_ms": 0, "duration_ms": 8000},
+                    {"id": "clip_002", "name": "Dialogue_Shot.mp4", "start_time_ms": 8000, "duration_ms": 6000}
+                ]
+            }
+        ],
+        "duration_ms": 14000
+    }
+
+    req = EditPlanRequest(
+        project_id="p_test19",
+        prompt="Trim the first clip to 5 seconds",
+        timeline_context=timeline_context
+    )
+    plan = AIEditingAssistant.parse_and_plan(req)
+    assert plan.is_valid is True
+    assert plan.confidence >= 0.8
+    assert len(plan.operations) == 1
+    op = plan.operations[0]
+    assert op.operation_type == EditOperationType.TRIM
+    assert op.target_id == "clip_001"
+    assert op.parameters["new_duration_ms"] == 5000
+    assert op.parameters["delta_ms"] == -3000
+
+
+@pytest.mark.asyncio
+async def test_phase19_02_parse_split_instruction():
+    """Phase 19 Test 02: Assistant parses split instruction at playhead."""
+    from app.services.ai_editing_assistant import AIEditingAssistant
+    from app.schemas.ai_schemas import EditPlanRequest, EditOperationType
+
+    timeline_context = {
+        "tracks": [
+            {
+                "id": "t_v1",
+                "name": "Video 1",
+                "track_type": "video",
+                "clips": [
+                    {"id": "clip_001", "name": "Scene_01.mp4", "start_time_ms": 0, "duration_ms": 10000}
+                ]
+            }
+        ],
+        "duration_ms": 10000
+    }
+
+    req = EditPlanRequest(
+        project_id="p_test19",
+        prompt="Split clip at playhead",
+        playhead_ms=4500,
+        timeline_context=timeline_context
+    )
+    plan = AIEditingAssistant.parse_and_plan(req)
+    assert plan.is_valid is True
+    assert len(plan.operations) == 1
+    op = plan.operations[0]
+    assert op.operation_type == EditOperationType.SPLIT
+    assert op.target_id == "clip_001"
+    assert op.parameters["playhead_ms"] == 4500
+
+
+@pytest.mark.asyncio
+async def test_phase19_03_parse_ripple_delete_instruction():
+    """Phase 19 Test 03: Assistant resolves 'ripple delete second clip'."""
+    from app.services.ai_editing_assistant import AIEditingAssistant
+    from app.schemas.ai_schemas import EditPlanRequest, EditOperationType
+
+    timeline_context = {
+        "tracks": [
+            {
+                "id": "t_v1",
+                "name": "Video 1",
+                "track_type": "video",
+                "clips": [
+                    {"id": "clip_a", "name": "Intro.mp4", "start_time_ms": 0, "duration_ms": 4000},
+                    {"id": "clip_b", "name": "Outtake.mp4", "start_time_ms": 4000, "duration_ms": 3000},
+                    {"id": "clip_c", "name": "Finale.mp4", "start_time_ms": 7000, "duration_ms": 5000}
+                ]
+            }
+        ],
+        "duration_ms": 12000
+    }
+
+    req = EditPlanRequest(
+        project_id="p_test19",
+        prompt="Ripple delete second clip",
+        timeline_context=timeline_context
+    )
+    plan = AIEditingAssistant.parse_and_plan(req)
+    assert plan.is_valid is True
+    assert len(plan.operations) == 1
+    op = plan.operations[0]
+    assert op.operation_type == EditOperationType.RIPPLE_DELETE
+    assert op.target_id == "clip_b"
+
+
+@pytest.mark.asyncio
+async def test_phase19_04_parse_audio_volume_and_mute():
+    """Phase 19 Test 04: Assistant targets audio and music tracks for volume / mute."""
+    from app.services.ai_editing_assistant import AIEditingAssistant
+    from app.schemas.ai_schemas import EditPlanRequest, EditOperationType
+
+    timeline_context = {
+        "tracks": [
+            {"id": "t_v1", "name": "Video 1", "track_type": "video", "track_role": "video", "clips": []},
+            {"id": "t_a1", "name": "Tamil BGM", "track_type": "audio", "track_role": "music", "clips": []}
+        ],
+        "duration_ms": 30000
+    }
+
+    # Test Mute
+    plan_mute = AIEditingAssistant.parse_and_plan(EditPlanRequest(
+        project_id="p_test19",
+        prompt="Mute background music",
+        timeline_context=timeline_context
+    ))
+    assert plan_mute.is_valid is True
+    assert len(plan_mute.operations) == 1
+    assert plan_mute.operations[0].operation_type == EditOperationType.MUTE
+    assert plan_mute.operations[0].track_id == "t_a1"
+
+    # Test Volume
+    plan_vol = AIEditingAssistant.parse_and_plan(EditPlanRequest(
+        project_id="p_test19",
+        prompt="Set music volume to -14dB",
+        timeline_context=timeline_context
+    ))
+    assert plan_vol.is_valid is True
+    assert plan_vol.operations[0].operation_type == EditOperationType.VOLUME
+    assert plan_vol.operations[0].parameters["volume_db"] == -14.0
+
+
+@pytest.mark.asyncio
+async def test_phase19_05_parse_transition_instruction():
+    """Phase 19 Test 05: Assistant parses crossfade / transition commands."""
+    from app.services.ai_editing_assistant import AIEditingAssistant
+    from app.schemas.ai_schemas import EditPlanRequest, EditOperationType
+
+    timeline_context = {
+        "tracks": [
+            {
+                "id": "t_v1",
+                "name": "Video 1",
+                "track_type": "video",
+                "clips": [
+                    {"id": "c1", "name": "Shot1.mp4", "start_time_ms": 0, "duration_ms": 5000}
+                ]
+            }
+        ],
+        "duration_ms": 5000
+    }
+
+    plan = AIEditingAssistant.parse_and_plan(EditPlanRequest(
+        project_id="p_test19",
+        prompt="Add 1s crossfade transition",
+        timeline_context=timeline_context
+    ))
+    assert plan.is_valid is True
+    assert len(plan.operations) == 1
+    assert plan.operations[0].operation_type == EditOperationType.TRANSITION
+    assert plan.operations[0].parameters["transition_type"] == "crossfade"
+    assert plan.operations[0].parameters["duration_ms"] == 1000
+
+
+@pytest.mark.asyncio
+async def test_phase19_06_parse_title_instruction():
+    """Phase 19 Test 06: Assistant parses title creation with Phase 18 graphics integration."""
+    from app.services.ai_editing_assistant import AIEditingAssistant
+    from app.schemas.ai_schemas import EditPlanRequest, EditOperationType
+
+    timeline_context = {
+        "tracks": [
+            {"id": "t_v1", "name": "Video 1", "track_type": "video", "clips": []},
+            {"id": "t_g1", "name": "Titles", "track_type": "video", "track_role": "graphics", "clips": []}
+        ],
+        "duration_ms": 20000
+    }
+
+    plan = AIEditingAssistant.parse_and_plan(EditPlanRequest(
+        project_id="p_test19",
+        prompt='Add title "HERO ENTRY" at the beginning',
+        timeline_context=timeline_context
+    ))
+    assert plan.is_valid is True
+    assert len(plan.operations) == 1
+    assert plan.operations[0].operation_type == EditOperationType.TITLE
+    assert plan.operations[0].parameters["text"] == "HERO ENTRY"
+
+
+@pytest.mark.asyncio
+async def test_phase19_07_rejects_dangerous_injections():
+    """Phase 19 Test 07: Assistant blocks dangerous system commands and destructive keywords."""
+    from app.services.ai_editing_assistant import AIEditingAssistant
+    from app.schemas.ai_schemas import EditPlanRequest, EditPlanStatus
+
+    plan = AIEditingAssistant.parse_and_plan(EditPlanRequest(
+        project_id="p_test19",
+        prompt="rm -rf / && delete database"
+    ))
+    assert plan.is_valid is False
+    assert plan.confidence == 0.0
+    assert plan.status == EditPlanStatus.UNSUPPORTED
+    assert len(plan.validation_errors) > 0
+
+
+@pytest.mark.asyncio
+async def test_phase19_08_flags_ambiguous_prompts():
+    """Phase 19 Test 08: Assistant flags ambiguous requests with suggestions."""
+    from app.services.ai_editing_assistant import AIEditingAssistant
+    from app.schemas.ai_schemas import EditPlanRequest, EditPlanStatus
+
+    plan = AIEditingAssistant.parse_and_plan(EditPlanRequest(
+        project_id="p_test19",
+        prompt="Make it viral and cool"
+    ))
+    assert plan.is_valid is False
+    assert plan.status == EditPlanStatus.AMBIGUOUS
+    assert plan.clarification_prompt is not None
+
+
+@pytest.mark.asyncio
+async def test_phase19_09_api_endpoint_editing_plan():
+    """Phase 19 Test 09: POST /api/v1/ai/editing-plan endpoint returns structured plan."""
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        pid = (await client.post("/api/v1/projects", json={"title": "Phase 19 API Plan Test"})).json()["id"]
+
+        response = await client.post("/api/v1/ai/editing-plan", json={
+            "project_id": pid,
+            "prompt": "Trim first clip to 4 seconds",
+            "timeline_context": {
+                "tracks": [
+                    {
+                        "id": "v1",
+                        "name": "Main Video",
+                        "track_type": "video",
+                        "clips": [
+                            {"id": "c_alpha", "name": "Intro.mp4", "start_time_ms": 0, "duration_ms": 7000}
+                        ]
+                    }
+                ],
+                "duration_ms": 7000
+            }
+        })
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["success"] is True
+        assert "plan" in payload
+        assert payload["plan"]["summary"] != ""
+        assert len(payload["plan"]["operations"]) == 1
+        assert payload["plan"]["operations"][0]["operation_type"] == "trim"
+
+
 

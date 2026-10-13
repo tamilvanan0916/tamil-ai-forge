@@ -14,6 +14,7 @@ import {
   Loader2,
   Menu,
   Activity,
+  Volume2,
 } from 'lucide-react';
 import { useProjectStore } from '../../stores/useProjectStore';
 import { useTimelineStore } from '../../stores/useTimelineStore';
@@ -38,70 +39,16 @@ export const TopBar: React.FC<TopBarProps> = ({ onMenuClick }) => {
     setSettingsModalOpen,
     setNewProjectModalOpen,
     setProjectStatusModalOpen,
+    setAIAssistantModalOpen,
+    setAudioStudioOpen,
     showNotification,
   } = useUIStore();
 
   const [isProjectMenuOpen, setProjectMenuOpen] = useState(false);
 
-  const handleRunAICommand = async (e: React.FormEvent) => {
+  const handleRunAICommand = (e: React.FormEvent) => {
     e.preventDefault();
-    if (!aiCommandPrompt.trim() || !activeProject) return;
-
-    setExecutingAICommand(true);
-    try {
-      const res = await api.post('/ai/command', {
-        project_id: activeProject.id,
-        command: aiCommandPrompt.trim(),
-      });
-      const data = res.data;
-      showNotification(`AI Action Executed: ${data.summary}`, 'success');
-
-      // Execute structured actions against timeline store if clip is selected
-      if (data.actions && data.actions.length > 0) {
-        const store = useTimelineStore.getState();
-        for (const act of data.actions) {
-          if (act.type === 'SET_CLIP_DURATION' && store.selectedClipId) {
-            store.updateClip(store.selectedClipId, c => { c.duration_ms = act.duration_ms || 8000; });
-          } else if ((act.type === 'SET_CLIP_COLOR' || act.type === 'APPLY_CINEMATIC_GRADE') && store.selectedClipId && act.color_grade) {
-            store.updateClip(store.selectedClipId, c => {
-              if (!c.metadata_info) c.metadata_info = {};
-              c.metadata_info.color_grade = { ...(c.metadata_info.color_grade || {}), ...act.color_grade };
-            });
-          } else if (act.type === 'SPLIT_CLIP' && store.selectedClipId) {
-            store.splitClipAtPlayhead(store.selectedClipId);
-          } else if (act.type === 'ADD_TRANSITION' && store.selectedClipId) {
-            store.setClipTransition(store.selectedClipId, 'out', {
-              type: act.details?.transition_type || 'crossfade',
-              duration_ms: act.details?.duration_ms || 1000,
-            });
-          } else if (act.type === 'MOVE_CLIP_TRACK' && store.selectedClipId && store.timeline) {
-            const trTarget = store.timeline.tracks.find(t =>
-              t.name.toUpperCase().includes(act.track_id || 'V2') ||
-              (t.order_index === 1 && t.track_type === 'video')
-            );
-            if (trTarget) {
-              const currentClip = store.timeline.tracks.flatMap(t => t.clips).find(c => c.id === store.selectedClipId);
-              if (currentClip) {
-                store.moveClipToTrack(store.selectedClipId, trTarget.id, currentClip.start_time_ms);
-              }
-            }
-          } else if (act.type === 'SET_TRACK_VOLUME' && store.timeline) {
-            const tr = store.timeline.tracks.find(t => t.track_role === 'music' || t.name.includes('Music'));
-            if (tr) store.setTrackVolume(tr.id, act.volume_db ?? -12.0);
-          } else if (act.type === 'SET_CLIP_SPEED' && store.selectedClipId) {
-            store.updateClip(store.selectedClipId, c => { c.speed_factor = act.details?.speed_factor || 0.5; });
-          } else if (act.type === 'RENDER_FILM') {
-            setExportModalOpen(true);
-          }
-        }
-      }
-
-      setAICommandPrompt('');
-    } catch (err: any) {
-      showNotification(`AI Command failed: ${err?.response?.data?.detail || err.message || 'Unknown error'}`, 'error');
-    } finally {
-      setExecutingAICommand(false);
-    }
+    setAIAssistantModalOpen(true);
   };
 
 
@@ -254,8 +201,32 @@ export const TopBar: React.FC<TopBarProps> = ({ onMenuClick }) => {
         </form>
       </div>
 
-      {/* Right Controls: Project Status, Render Queue, Export, Settings */}
+      {/* Right Controls: Audio Studio, AI Assistant, Project Status, Render Queue, Export, Settings */}
       <div className="flex items-center gap-2">
+        <button
+          type="button"
+          id="topbar-audio-studio-btn"
+          data-testid="topbar-audio-studio-btn"
+          onClick={() => setAudioStudioOpen(true)}
+          className="flex items-center gap-1.5 px-2.5 py-1.5 bg-cinema-800 hover:bg-cinema-700 border border-emerald-500/40 rounded text-xs text-emerald-400 transition-colors shadow-sm shadow-emerald-950/20"
+          title="Audio & Music Studio / Multi-Track Mixer"
+        >
+          <Volume2 className="w-3.5 h-3.5 text-emerald-400" />
+          <span className="hidden md:inline font-medium">Audio Studio</span>
+        </button>
+
+        <button
+          type="button"
+          id="topbar-ai-assistant-btn"
+          data-testid="topbar-ai-assistant-btn"
+          onClick={() => setAIAssistantModalOpen(true)}
+          className="flex items-center gap-1.5 px-2.5 py-1.5 bg-cinema-800 hover:bg-cinema-700 border border-cinema-ai/40 rounded text-xs text-cinema-ai transition-colors shadow-sm shadow-cinema-ai/10"
+          title="AI Editing Assistant / Prompt-to-Edit"
+        >
+          <Sparkles className="w-3.5 h-3.5 text-cinema-ai animate-pulse-cyan" />
+          <span className="hidden md:inline font-medium">AI Assistant</span>
+        </button>
+
         <button
           type="button"
           id="topbar-project-status-btn"

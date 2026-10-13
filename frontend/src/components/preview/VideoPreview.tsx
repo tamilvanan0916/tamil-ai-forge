@@ -17,11 +17,12 @@ import {
   Film,
   AlertCircle,
 } from 'lucide-react';
-import { useTimelineStore } from '../../stores/useTimelineStore';
+import { useTimelineStore, evaluateEffectiveClipGain, evaluateClipProperty } from '../../stores/useTimelineStore';
 import { useProjectStore } from '../../stores/useProjectStore';
 import { mediaUrl } from '../../services/api';
 import { Clip, Track } from '../../types';
 import { AudioMeter } from './AudioMeter';
+import { audioPreviewEngine } from '../../services/audioPreviewEngine';
 
 export const VideoPreview: React.FC = () => {
   const {
@@ -33,6 +34,10 @@ export const VideoPreview: React.FC = () => {
     toggleLoop,
     stop,
     timeline,
+    activeMonitorFocus,
+    setActiveMonitorFocus,
+    shuttleRate,
+    shuttleStop,
   } = useTimelineStore();
   const { activeProject, getAsset } = useProjectStore();
 
@@ -66,7 +71,73 @@ export const VideoPreview: React.FC = () => {
       const clip = track.clips.find(
         (c) => c.start_time_ms <= playheadMs && playheadMs < c.start_time_ms + c.duration_ms
       );
-      if (clip) return { clip, track };
+      if (clip) {
+        if (clip.is_compound && clip.nested_tracks && clip.nested_tracks.length > 0) {
+          const localOffsetMs = playheadMs - clip.start_time_ms;
+          const nestedVideoTracks = clip.nested_tracks
+            .filter((nt) => (nt.track_type === 'video' || nt.track_role === 'graphics') && !nt.is_muted && nt.is_visible)
+            .sort((a, b) => b.order_index - a.order_index);
+          for (const nt of nestedVideoTracks) {
+            const childClip = nt.clips.find(
+              (cc) => cc.start_time_ms <= localOffsetMs && localOffsetMs < cc.start_time_ms + cc.duration_ms
+            );
+            if (childClip) {
+              return {
+                clip: {
+                  ...childClip,
+                  start_time_ms: clip.start_time_ms + childClip.start_time_ms,
+                },
+                track: nt,
+              };
+            }
+          }
+        }
+        return { clip, track };
+      }
+    }
+    return null;
+  }, [timeline, playheadMs]);
+
+  // Check if current playhead falls inside a video transition between two adjacent clips
+  const activeTransition = useMemo<{
+    type: 'crossfade' | 'fade_black' | 'fade_white';
+    progress: number;
+    clipA: Clip;
+    clipB: Clip;
+    track: Track;
+  } | null>(() => {
+    if (!timeline?.tracks) return null;
+    const videoTracks = timeline.tracks
+      .filter((t) => (t.track_type === 'video' || t.track_role === 'video') && !t.is_muted && t.is_visible);
+
+    for (const track of videoTracks) {
+      const sortedClips = [...track.clips].sort((a, b) => a.start_time_ms - b.start_time_ms);
+      for (let i = 0; i < sortedClips.length - 1; i++) {
+        const clipA = sortedClips[i];
+        const clipB = sortedClips[i + 1];
+        const trans = clipA.transition_out;
+        if (!trans || !trans.type || !trans.duration_ms) continue;
+
+        const durMs = Number(trans.duration_ms) || 1000;
+        const boundaryMs = clipB.start_time_ms;
+        const startTrans = Math.max(clipA.start_time_ms, boundaryMs - durMs / 2);
+        const endTrans = Math.min(clipB.start_time_ms + clipB.duration_ms, boundaryMs + durMs / 2);
+
+        if (playheadMs >= startTrans && playheadMs <= endTrans) {
+          const span = endTrans - startTrans || 1;
+          const progress = Math.max(0, Math.min(1, (playheadMs - startTrans) / span));
+          const type = (trans.type === 'fade_black' || trans.type === 'fade_white' || trans.type === 'crossfade')
+            ? trans.type
+            : 'crossfade';
+          return {
+            type,
+            progress,
+            clipA,
+            clipB,
+            track,
+          };
+        }
+      }
     }
     return null;
   }, [timeline, playheadMs]);
@@ -134,6 +205,7 @@ export const VideoPreview: React.FC = () => {
       trackRole: string;
       trackName: string;
       trackVolumeDb: number;
+      trackPan: number;
       clip: Clip;
       url: string;
     }> = [];
@@ -162,6 +234,7 @@ export const VideoPreview: React.FC = () => {
           trackRole: track.track_role,
           trackName: track.name,
           trackVolumeDb: track.volume_db ?? 0,
+          trackPan: track.pan ?? 0.0,
           clip,
           url,
         });
@@ -202,10 +275,14 @@ export const VideoPreview: React.FC = () => {
     return null;
   }, [timeline, playheadMs]);
 
-  // Synchronize multi-track audio playback with playhead, volume, and play/pause
+  // Synchronize multi-track audio playback with playhead, volume, automation, and play/pause
   useEffect(() => {
     const pool = audioPoolRef.current;
     const activeTrackIds = new Set<string>();
+
+    if (isPlaying) {
+      audioPreviewEngine.ensureContextRunning();
+    }
 
     for (const item of activeAudioClips) {
       activeTrackIds.add(item.trackId);
@@ -215,6 +292,7 @@ export const VideoPreview: React.FC = () => {
         audio = new Audio();
         audio.preload = 'auto';
         pool.set(item.trackId, audio);
+        audioPreviewEngine.connectAudioElement(item.trackId, audio);
       }
 
       // Check src match
@@ -223,18 +301,36 @@ export const VideoPreview: React.FC = () => {
         audio.src = item.url;
       }
 
-      // Compute volume with dB to linear conversion
-      const totalDb = item.trackVolumeDb + (item.clip.volume_db ?? 0);
-      const linearVol = Math.pow(10, totalDb / 20);
-      const targetVolume = isMuted ? 0 : Math.max(0, Math.min(1, volume * linearVol));
+      // Compute evaluated volume using Phase 21 keyframe automation + fades + track volume
+      const clipOffsetMs = Math.max(0, playheadMs - item.clip.start_time_ms);
+      const { volumeDb, linearGain } = evaluateEffectiveClipGain(
+        item.clip,
+        clipOffsetMs,
+        item.trackVolumeDb
+      );
+      const targetVolume = isMuted ? 0 : Math.max(0, Math.min(1, volume * linearGain));
       audio.volume = targetVolume;
       audio.muted = isMuted;
 
-      // Sync playback position
+      // Update Web Audio nodes
+      audioPreviewEngine.updateTrackParameters(
+        item.trackId,
+        isMuted ? 0 : linearGain,
+        item.trackPan
+      );
+
+      // Sync playback position & mute above 2x or during reverse shuttle
       const speed = item.clip.speed_factor || 1.0;
-      audio.playbackRate = speed;
-      const clipOffsetMs = (playheadMs - item.clip.start_time_ms) * speed;
-      const targetSec = Math.max(0, (item.clip.source_in_ms + clipOffsetMs) / 1000.0);
+      const isShuttleFast = Math.abs(shuttleRate) > 2 || shuttleRate < 0;
+      if (isShuttleFast) {
+        audio.muted = true;
+      } else {
+        audio.muted = isMuted;
+        try {
+          audio.playbackRate = Math.max(0.25, Math.min(4, speed * (shuttleRate > 0 ? shuttleRate : 1.0)));
+        } catch {}
+      }
+      const targetSec = Math.max(0, (item.clip.source_in_ms + clipOffsetMs * speed) / 1000.0);
 
       if (Math.abs(audio.currentTime - targetSec) > 0.2) {
         audio.currentTime = targetSec;
@@ -277,31 +373,110 @@ export const VideoPreview: React.FC = () => {
     };
   }, []);
 
-  // 4. Seek HTML5 video when scrubbing / seeking
+  // 4. Seek HTML5 video when scrubbing / seeking / playing
   useEffect(() => {
     if (!activeMedia || activeMedia.type !== 'video' || !videoRef.current) return;
     const clip = activeMedia.clip;
     const speed = clip.speed_factor || 1.0;
-    const clipOffsetMs = (playheadMs - clip.start_time_ms) * speed;
-    const targetSec = Math.max(0, (clip.source_in_ms + clipOffsetMs) / 1000.0);
+    const isReversed = !!clip.is_reversed;
+    const clipOffsetMs = Math.max(0, playheadMs - clip.start_time_ms);
 
-    // Only seek if drift exceeds threshold to avoid stutter during playback
-    if (Math.abs(videoRef.current.currentTime - targetSec) > 0.18) {
-      videoRef.current.currentTime = targetSec;
+    const isFrozen = Boolean(clip.is_frozen);
+    const freezeAtMs = clip.freeze_at_ms ?? 0;
+    const freezeDurMs = clip.freeze_duration_ms ?? 2000;
+    const isHoldingFreeze = isFrozen && clipOffsetMs >= freezeAtMs && clipOffsetMs < (freezeAtMs + freezeDurMs);
+
+    const isFrameHold = Boolean(clip.is_frame_hold);
+    const holdAtMs = clip.frame_hold_at_ms ?? 0;
+    const holdDurMs = clip.frame_hold_duration_ms ?? 2000;
+    const isHoldingFrame = isFrameHold && clipOffsetMs >= holdAtMs && clipOffsetMs < (holdAtMs + holdDurMs);
+
+    let effectiveOffsetMs = clipOffsetMs;
+    if (isFrozen) {
+      if (clipOffsetMs >= freezeAtMs && clipOffsetMs < (freezeAtMs + freezeDurMs)) {
+        effectiveOffsetMs = freezeAtMs;
+      } else if (clipOffsetMs >= (freezeAtMs + freezeDurMs)) {
+        effectiveOffsetMs = clipOffsetMs - freezeDurMs;
+      }
+    } else if (isFrameHold) {
+      if (clipOffsetMs >= holdAtMs && clipOffsetMs < (holdAtMs + holdDurMs)) {
+        effectiveOffsetMs = holdAtMs;
+      } else {
+        effectiveOffsetMs = clipOffsetMs;
+      }
     }
-  }, [playheadMs, activeMedia]);
+
+    let targetSec: number;
+    if (isReversed) {
+      const srcDuration =
+        clip.source_out_ms > clip.source_in_ms
+          ? clip.source_out_ms - clip.source_in_ms
+          : clip.duration_ms * speed;
+      targetSec = Math.max(
+        0,
+        (clip.source_in_ms + srcDuration - effectiveOffsetMs * speed) / 1000.0
+      );
+    } else {
+      targetSec = Math.max(0, (clip.source_in_ms + effectiveOffsetMs * speed) / 1000.0);
+    }
+
+    if (isReversed || isHoldingFreeze || isHoldingFrame || shuttleRate < 0) {
+      // In reverse mode, freeze hold, frame hold window, or reverse shuttle, drive frames directly from playhead tick
+      videoRef.current.currentTime = targetSec;
+    } else {
+      // In forward mode, update playback rate and seek only if drift exceeds threshold
+      try {
+        const effectiveRate = shuttleRate > 0 ? shuttleRate : 1.0;
+        videoRef.current.playbackRate = Math.max(0.25, Math.min(16, speed * effectiveRate));
+      } catch {}
+
+      if (Math.abs(videoRef.current.currentTime - targetSec) > 0.18) {
+        videoRef.current.currentTime = targetSec;
+      }
+    }
+  }, [playheadMs, activeMedia, shuttleRate]);
 
   // 5. Sync play / pause with HTML5 video
   useEffect(() => {
     const video = videoRef.current;
     if (!video) return;
 
+    const clip = activeMedia?.clip;
+    const isReversed = clip?.is_reversed;
+    const clipOffsetMs = clip ? Math.max(0, playheadMs - clip.start_time_ms) : 0;
+    const isHoldingFreeze = Boolean(
+      clip?.is_frozen &&
+      clipOffsetMs >= (clip.freeze_at_ms ?? 0) &&
+      clipOffsetMs < ((clip.freeze_at_ms ?? 0) + (clip.freeze_duration_ms ?? 2000))
+    );
+    const isHoldingFrame = Boolean(
+      clip?.is_frame_hold &&
+      clipOffsetMs >= (clip.frame_hold_at_ms ?? 0) &&
+      clipOffsetMs < ((clip.frame_hold_at_ms ?? 0) + (clip.frame_hold_duration_ms ?? 2000))
+    );
+
     if (isPlaying) {
-      video.play().catch(() => {});
+      if (isReversed || isHoldingFreeze || isHoldingFrame || shuttleRate < 0) {
+        // In reverse mode, freeze hold, frame hold, or reverse shuttle, maintain video element paused; playhead tick drives frames
+        video.pause();
+      } else {
+        video.play().catch(() => {});
+      }
     } else {
       video.pause();
     }
-  }, [isPlaying]);
+  }, [
+    isPlaying,
+    activeMedia?.clip?.is_reversed,
+    activeMedia?.clip?.is_frozen,
+    activeMedia?.clip?.freeze_at_ms,
+    activeMedia?.clip?.freeze_duration_ms,
+    activeMedia?.clip?.is_frame_hold,
+    activeMedia?.clip?.frame_hold_at_ms,
+    activeMedia?.clip?.frame_hold_duration_ms,
+    playheadMs,
+    shuttleRate,
+  ]);
 
   // 6. Sync volume and mute to video element
   useEffect(() => {
@@ -320,27 +495,49 @@ export const VideoPreview: React.FC = () => {
       const delta = now - lastTimeRef.current;
       lastTimeRef.current = now;
 
-      const nextMs = playheadRef.current + delta;
-      const endMs = timeline?.duration_ms ?? Infinity;
+      const rate = shuttleRate !== 0 ? shuttleRate : 1.0;
+      const nextMs = playheadRef.current + delta * rate;
 
-      if (nextMs >= endMs) {
-        if (isLooping) {
+      if (rate < 0) {
+        if (nextMs <= 0) {
           setPlayhead(0);
           playheadRef.current = 0;
-        } else {
-          setPlayhead(endMs);
-          playheadRef.current = endMs;
-          useTimelineStore.getState().togglePlay();
+          shuttleStop();
           return;
+        } else {
+          setPlayhead(nextMs);
+          playheadRef.current = nextMs;
         }
       } else {
-        setPlayhead(nextMs);
-        playheadRef.current = nextMs;
+        const hasWorkArea = Boolean(
+          timeline?.in_point_ms !== null &&
+          timeline?.in_point_ms !== undefined &&
+          timeline?.out_point_ms !== null &&
+          timeline?.out_point_ms !== undefined &&
+          timeline.out_point_ms > timeline.in_point_ms
+        );
+        const loopStartMs = hasWorkArea ? timeline!.in_point_ms! : 0;
+        const endMs = hasWorkArea ? timeline!.out_point_ms! : (timeline?.duration_ms ?? Infinity);
+
+        if (nextMs >= endMs) {
+          if (isLooping) {
+            setPlayhead(loopStartMs);
+            playheadRef.current = loopStartMs;
+          } else {
+            setPlayhead(endMs);
+            playheadRef.current = endMs;
+            shuttleStop();
+            return;
+          }
+        } else {
+          setPlayhead(nextMs);
+          playheadRef.current = nextMs;
+        }
       }
 
       rafRef.current = requestAnimationFrame(tick);
     },
-    [isLooping, setPlayhead, timeline?.duration_ms]
+    [isLooping, setPlayhead, timeline?.duration_ms, timeline?.in_point_ms, timeline?.out_point_ms, shuttleRate, shuttleStop]
   );
 
   useEffect(() => {
@@ -404,16 +601,37 @@ export const VideoPreview: React.FC = () => {
     ? `${activeProject.settings.width}×${activeProject.settings.height} @ ${activeProject.settings.fps}fps`
     : '1920×1080 @ 30fps';
 
-  // Compute CSS spatial transforms for active clip
+  // Compute CSS spatial transforms for active clip (evaluating keyframes against current playhead)
   const clipTransformStyle = useMemo<React.CSSProperties>(() => {
     if (!activeVisual?.clip) return {};
     const c = activeVisual.clip;
-    const posX = ((c.position_x ?? 0.5) - 0.5) * 100;
-    const posY = ((c.position_y ?? 0.5) - 0.5) * 100;
-    const scaleX = c.scale_x ?? 1.0;
-    const scaleY = c.scale_y ?? 1.0;
-    const rot = c.rotation ?? 0.0;
-    const opacity = c.opacity ?? 1.0;
+    const clipOffsetMs = Math.max(0, playheadMs - c.start_time_ms);
+
+    const posXVal = evaluateClipProperty(c, 'position_x', clipOffsetMs, c.position_x ?? 0.5);
+    const posYVal = evaluateClipProperty(c, 'position_y', clipOffsetMs, c.position_y ?? 0.5);
+    const scaleX = evaluateClipProperty(c, 'scale_x', clipOffsetMs, c.scale_x ?? 1.0);
+    const scaleY = evaluateClipProperty(c, 'scale_y', clipOffsetMs, c.scale_y ?? 1.0);
+    const rot = evaluateClipProperty(c, 'rotation', clipOffsetMs, c.rotation ?? 0.0);
+    let opacity = evaluateClipProperty(c, 'opacity', clipOffsetMs, c.opacity ?? 1.0);
+
+    if (activeTransition) {
+      if (activeTransition.type === 'crossfade') {
+        if (c.id === activeTransition.clipA.id) {
+          opacity *= (1 - activeTransition.progress);
+        } else if (c.id === activeTransition.clipB.id) {
+          opacity *= activeTransition.progress;
+        }
+      } else if (activeTransition.type === 'fade_black' || activeTransition.type === 'fade_white') {
+        if (activeTransition.progress <= 0.5) {
+          opacity *= Math.max(0, 1 - activeTransition.progress * 2);
+        } else {
+          opacity *= Math.max(0, (activeTransition.progress - 0.5) * 2);
+        }
+      }
+    }
+
+    const posX = (posXVal - 0.5) * 100;
+    const posY = (posYVal - 0.5) * 100;
     const blendMode = (c.blend_mode as any) || 'normal';
 
     const cropTop = c.crop_top ?? 0;
@@ -428,16 +646,24 @@ export const VideoPreview: React.FC = () => {
       mixBlendMode: blendMode,
       clipPath: hasCrop ? `inset(${cropTop}% ${cropRight}% ${cropBottom}% ${cropLeft}%)` : undefined,
     };
-  }, [activeVisual]);
+  }, [activeVisual, playheadMs, activeTransition]);
 
   return (
     <div
+      id="video-preview"
       ref={containerRef}
-      className="flex flex-col bg-cinema-void border-b border-cinema-border relative overflow-hidden select-none h-full"
+      tabIndex={0}
+      onClick={() => setActiveMonitorFocus('program')}
+      className={`flex flex-col bg-cinema-void border-b border-cinema-border relative overflow-hidden select-none h-full border-2 transition-all duration-150 ${
+        activeMonitorFocus === 'program' ? 'border-cyan-500/80 shadow-[0_0_15px_rgba(6,182,212,0.15)]' : 'border-cinema-border/50'
+      }`}
     >
       {/* Top Preview Status Bar */}
       <div className="h-8 bg-cinema-900/90 border-b border-cinema-border/60 flex items-center justify-between px-3 text-[11px] text-cinema-textDim z-10 flex-shrink-0">
         <div className="flex items-center gap-2 md:gap-3 overflow-hidden">
+          <span className="px-1.5 py-0.5 rounded text-[10px] font-bold tracking-wider bg-cyan-500/20 text-cyan-400 border border-cyan-500/40">
+            PROGRAM
+          </span>
           <span className="font-mono text-cinema-ai font-bold tracking-wider text-[10px] md:text-[11px] flex-shrink-0">
             {formatTimecode(playheadMs, fps)}
           </span>
@@ -542,6 +768,107 @@ export const VideoPreview: React.FC = () => {
               </p>
             </div>
           )}
+
+          {/* Video Transition Visualizer Overlay */}
+          {activeTransition && (
+            <div
+              data-testid="preview-transition-overlay"
+              className="absolute inset-0 pointer-events-none z-25 flex flex-col items-center justify-end pb-3 overflow-hidden"
+            >
+              {activeTransition.type === 'fade_black' && (
+                <div
+                  className="absolute inset-0 bg-black pointer-events-none transition-opacity"
+                  style={{
+                    opacity: 1 - 2 * Math.abs(activeTransition.progress - 0.5),
+                  }}
+                />
+              )}
+              {activeTransition.type === 'fade_white' && (
+                <div
+                  className="absolute inset-0 bg-white pointer-events-none transition-opacity"
+                  style={{
+                    opacity: 1 - 2 * Math.abs(activeTransition.progress - 0.5),
+                  }}
+                />
+              )}
+              {activeTransition.type === 'crossfade' && (
+                <div
+                  className="absolute inset-0 bg-gradient-to-r from-cyan-500/10 via-transparent to-cyan-500/10 pointer-events-none"
+                  style={{
+                    opacity: 1 - 2 * Math.abs(activeTransition.progress - 0.5),
+                  }}
+                />
+              )}
+
+              {/* Transition Indicator Pill */}
+              <div className="z-30 px-2 py-0.5 rounded-full bg-cinema-900/90 border border-cinema-ai/40 text-[9px] font-mono text-cinema-ai backdrop-blur flex items-center gap-1.5 shadow-lg">
+                <span className="w-1.5 h-1.5 rounded-full bg-cinema-ai animate-pulse" />
+                <span>
+                  {activeTransition.type === 'crossfade'
+                    ? 'Crossfade'
+                    : activeTransition.type === 'fade_black'
+                    ? 'Fade Black'
+                    : 'Fade White'}{' '}
+                  {Math.round(activeTransition.progress * 100)}%
+                </span>
+                <span className="text-cinema-textDim">
+                  ({activeTransition.clipA.name} → {activeTransition.clipB.name})
+                </span>
+              </div>
+            </div>
+          )}
+
+          {/* Active clip speed & direction indicator HUD */}
+          {activeMedia?.clip && ((activeMedia.clip.speed_factor && activeMedia.clip.speed_factor !== 1.0) || activeMedia.clip.is_reversed) && (
+            <div
+              data-testid="preview-speed-badge"
+              className="absolute top-3 right-3 z-30 flex items-center gap-1.5 px-2 py-0.5 rounded-full bg-cinema-900/90 border border-cinema-border/80 text-[10px] font-mono text-cinema-text backdrop-blur shadow-md"
+            >
+              <span className="w-1.5 h-1.5 rounded-full bg-amber-400" />
+              <span>{activeMedia.clip.speed_factor ?? 1.0}x</span>
+              {activeMedia.clip.is_reversed && (
+                <span className="text-amber-400 font-semibold">REW</span>
+              )}
+            </div>
+          )}
+
+          {/* Phase 28: Freeze frame indicator HUD */}
+          {activeMedia?.clip?.is_frozen && (() => {
+            const clip = activeMedia.clip;
+            const clipOffsetMs = Math.max(0, playheadMs - clip.start_time_ms);
+            const freezeAt = clip.freeze_at_ms ?? 0;
+            const freezeDur = clip.freeze_duration_ms ?? 2000;
+            const isHolding = clipOffsetMs >= freezeAt && clipOffsetMs < (freezeAt + freezeDur);
+            return (
+              <div
+                data-testid="preview-freeze-badge"
+                className={`absolute top-3 ${((activeMedia.clip.speed_factor && activeMedia.clip.speed_factor !== 1.0) || activeMedia.clip.is_reversed) ? 'right-28' : 'right-3'} z-30 flex items-center gap-1.5 px-2 py-0.5 rounded-full bg-cinema-900/90 border ${isHolding ? 'border-cyan-400 text-cyan-300' : 'border-cinema-border/80 text-cinema-textDim'} text-[10px] font-mono backdrop-blur shadow-md`}
+              >
+                <span className={`w-1.5 h-1.5 rounded-full ${isHolding ? 'bg-cyan-400 animate-pulse' : 'bg-cyan-600'}`} />
+                <span>FREEZE {freezeDur / 1000}s</span>
+                {isHolding && <span className="text-[9px] uppercase tracking-wider text-cyan-300 font-bold">HOLD</span>}
+              </div>
+            );
+          })()}
+
+          {/* Phase 29: Frame hold indicator HUD */}
+          {activeMedia?.clip?.is_frame_hold && (() => {
+            const clip = activeMedia.clip;
+            const clipOffsetMs = Math.max(0, playheadMs - clip.start_time_ms);
+            const holdAt = clip.frame_hold_at_ms ?? 0;
+            const holdDur = clip.frame_hold_duration_ms ?? 2000;
+            const isHolding = clipOffsetMs >= holdAt && clipOffsetMs < (holdAt + holdDur);
+            return (
+              <div
+                data-testid="preview-frame-hold-badge"
+                className={`absolute top-3 ${((activeMedia.clip.speed_factor && activeMedia.clip.speed_factor !== 1.0) || activeMedia.clip.is_reversed) ? 'right-28' : 'right-3'} z-30 flex items-center gap-1.5 px-2 py-0.5 rounded-full bg-cinema-900/90 border ${isHolding ? 'border-emerald-400 text-emerald-300' : 'border-cinema-border/80 text-cinema-textDim'} text-[10px] font-mono backdrop-blur shadow-md`}
+              >
+                <span className={`w-1.5 h-1.5 rounded-full ${isHolding ? 'bg-emerald-400 animate-pulse' : 'bg-emerald-600'}`} />
+                <span>FRAME HOLD {holdDur / 1000}s</span>
+                {isHolding && <span className="text-[9px] uppercase tracking-wider text-emerald-300 font-bold">HOLD</span>}
+              </div>
+            );
+          })()}
 
           {/* Media loading indicator */}
           {mediaLoading && (
@@ -697,7 +1024,7 @@ export const VideoPreview: React.FC = () => {
       </div>
 
       {/* Bottom Transport Controls Bar */}
-      <div className="h-10 bg-cinema-900 border-t border-cinema-border flex items-center justify-between px-2 md:px-4 z-10 flex-shrink-0">
+      <div id="transport-controls" data-testid="transport-controls" className="h-10 bg-cinema-900 border-t border-cinema-border flex items-center justify-between px-2 md:px-4 z-10 flex-shrink-0">
         <div className="flex items-center gap-0.5 md:gap-1">
           <button
             type="button"
@@ -717,7 +1044,11 @@ export const VideoPreview: React.FC = () => {
           </button>
           <button
             type="button"
-            onClick={togglePlay}
+            data-testid="transport-play-btn"
+            onClick={async () => {
+              await audioPreviewEngine.ensureContextRunning();
+              togglePlay();
+            }}
             title={isPlaying ? 'Pause (Space)' : 'Play (Space)'}
             className="p-1.5 bg-cinema-red hover:bg-cinema-redHover text-white rounded transition-colors shadow-lg shadow-red-950/40"
           >

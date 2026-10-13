@@ -12,7 +12,11 @@ import { useIsMobile } from '../../hooks/useMediaQuery';
 
 export const MediaBrowserPanel: React.FC = () => {
   const { activeProject } = useProjectStore();
-  const { timeline, addClipToTrack, playheadMs } = useTimelineStore();
+  const {
+    timeline, addClipToTrack, playheadMs, loadSourceAsset,
+    highlightedAssetId, setHighlightedAssetId,
+    findAssetTimelineOccurrences, jumpToTimelineOccurrence,
+  } = useTimelineStore();
   const { showNotification } = useUIStore();
   const isMobile = useIsMobile();
 
@@ -24,9 +28,23 @@ export const MediaBrowserPanel: React.FC = () => {
   const [isUploading, setIsUploading] = useState(false);
   const [uploadProgress, setUploadProgress] = useState<string | null>(null);
   const [selectedAssetId, setSelectedAssetId] = useState<string | null>(null);
+  const [activeUsagePopoverId, setActiveUsagePopoverId] = useState<string | null>(null);
   const [deleteConfirmId, setDeleteConfirmId] = useState<string | null>(null);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    if (highlightedAssetId) {
+      const el = document.getElementById(`asset-item-${highlightedAssetId}`);
+      if (el) {
+        el.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+      }
+      const timer = setTimeout(() => {
+        setHighlightedAssetId(null);
+      }, 4000);
+      return () => clearTimeout(timer);
+    }
+  }, [highlightedAssetId, setHighlightedAssetId]);
 
   const loadAssets = useCallback(async () => {
     if (!activeProject) return;
@@ -192,11 +210,22 @@ export const MediaBrowserPanel: React.FC = () => {
         </button>
       </div>
 
-      {/* Selected asset "Add to Timeline" action bar */}
+      {/* Selected asset "Add to Timeline" and "Source Monitor" action bar */}
       {selectedAsset && (
         <div className="flex items-center gap-2 px-2 py-1.5 bg-cinema-ai/10 border-b border-cinema-ai/30">
           {getTypeIcon(selectedAsset.asset_type)}
           <span className="text-[10px] text-cinema-ai font-medium truncate flex-1">{selectedAsset.file_name}</span>
+          <button
+            id="open-source-monitor-btn"
+            onClick={() => {
+              loadSourceAsset(selectedAsset);
+              showNotification(`Opened in Source Monitor: ${selectedAsset.file_name}`, 'info');
+            }}
+            className="flex items-center gap-1 px-2 py-1 bg-amber-500/20 hover:bg-amber-500/30 text-amber-300 border border-amber-500/40 rounded text-[10px] font-semibold transition-colors flex-shrink-0"
+            title="Open in Source Monitor"
+          >
+            <Film className="w-3 h-3" /> Source
+          </button>
           <button
             onClick={() => handleAddToTimeline(selectedAsset)}
             className="flex items-center gap-1 px-2 py-1 bg-cinema-ai text-black rounded text-[10px] font-semibold hover:bg-cyan-300 transition-colors flex-shrink-0"
@@ -244,13 +273,24 @@ export const MediaBrowserPanel: React.FC = () => {
           <div className="grid grid-cols-2 gap-1.5">
             {filtered.map((asset) => {
               const isAssetSelected = selectedAssetId === asset.id;
+              const isHighlighted = highlightedAssetId === asset.id;
+              const occurrences = findAssetTimelineOccurrences(asset.id);
               return (
                 <div
+                  id={`asset-item-${asset.id}`}
                   key={asset.id}
                   className={`group relative bg-cinema-850 border rounded-md overflow-hidden cursor-pointer transition-all ${
-                    isAssetSelected ? 'border-cinema-ai ring-1 ring-cinema-ai/50' : 'border-cinema-border hover:border-cinema-ai/40'
+                    isHighlighted
+                      ? 'border-amber-400 ring-2 ring-amber-400 animate-pulse bg-amber-950/30'
+                      : isAssetSelected
+                      ? 'border-cinema-ai ring-1 ring-cinema-ai/50'
+                      : 'border-cinema-border hover:border-cinema-ai/40'
                   }`}
                   onClick={() => setSelectedAssetId(isAssetSelected ? null : asset.id)}
+                  onDoubleClick={() => {
+                    loadSourceAsset(asset);
+                    showNotification(`Opened in Source Monitor: ${asset.file_name}`, 'info');
+                  }}
                   draggable
                   onDragStart={(e) => {
                     e.dataTransfer.setData('application/x-asset-id', asset.id);
@@ -274,9 +314,59 @@ export const MediaBrowserPanel: React.FC = () => {
                         {formatDuration(asset.duration_ms)}
                       </span>
                     )}
+                    {/* Usage Badge */}
+                    <div className="absolute top-1 left-1 z-10">
+                      <button
+                        id={`asset-usage-badge-${asset.id}`}
+                        data-testid={`asset-usage-badge-${asset.id}`}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          if (occurrences.length > 0) {
+                            setActiveUsagePopoverId(activeUsagePopoverId === asset.id ? null : asset.id);
+                          }
+                        }}
+                        className={`px-1 py-0.2 rounded text-[8px] font-mono backdrop-blur-sm transition-colors ${
+                          occurrences.length > 0
+                            ? 'bg-emerald-950/85 text-emerald-300 border border-emerald-500/50 hover:bg-emerald-900/90'
+                            : 'bg-black/60 text-cinema-textDim/80 border border-cinema-border/40'
+                        }`}
+                        title={occurrences.length > 0 ? `${occurrences.length} instances on timeline. Click to view.` : 'Unused'}
+                      >
+                        {occurrences.length > 0 ? `Used (${occurrences.length})` : 'Unused'}
+                      </button>
+
+                      {activeUsagePopoverId === asset.id && occurrences.length > 0 && (
+                        <div
+                          id={`asset-usage-popover-${asset.id}`}
+                          data-testid={`asset-usage-popover-${asset.id}`}
+                          className="absolute z-50 left-0 top-full mt-1 w-44 bg-cinema-900 border border-cinema-border rounded shadow-2xl p-1 text-[10px] text-cinema-text backdrop-blur-md"
+                          onClick={(e) => e.stopPropagation()}
+                        >
+                          <div className="text-[9px] text-cinema-textDim font-medium mb-1 px-1 border-b border-cinema-border/50 pb-0.5">
+                            Occurrences ({occurrences.length})
+                          </div>
+                          <div className="max-h-28 overflow-y-auto space-y-0.5">
+                            {occurrences.map((occ) => (
+                              <button
+                                key={occ.clipId}
+                                onClick={() => {
+                                  jumpToTimelineOccurrence(occ.clipId);
+                                  setActiveUsagePopoverId(null);
+                                  showNotification(`Jumped to ${occ.trackName} at ${formatDuration(occ.startMs)}`, 'info');
+                                }}
+                                className="w-full text-left px-1.5 py-0.5 rounded bg-cinema-850 hover:bg-amber-950/70 hover:text-amber-200 transition-colors flex items-center justify-between text-[9px]"
+                              >
+                                <span className="truncate max-w-[80px] text-cinema-ai">[{occ.trackName}]</span>
+                                <span className="font-mono text-cinema-textDim">{formatDuration(occ.startMs)}</span>
+                              </button>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+                    </div>
                     {/* Delete button on hover */}
                     <button
-                      className="absolute top-1 right-1 p-0.5 bg-black/70 rounded opacity-0 group-hover:opacity-100 transition-opacity text-red-400 hover:text-red-300"
+                      className="absolute top-1 right-1 p-0.5 bg-black/70 rounded opacity-0 group-hover:opacity-100 transition-opacity text-red-400 hover:text-red-300 z-10"
                       onClick={(e) => { e.stopPropagation(); setDeleteConfirmId(asset.id); }}
                       title="Delete asset"
                     >
@@ -298,13 +388,24 @@ export const MediaBrowserPanel: React.FC = () => {
           <div className="space-y-1">
             {filtered.map((asset) => {
               const isAssetSelected = selectedAssetId === asset.id;
+              const isHighlighted = highlightedAssetId === asset.id;
+              const occurrences = findAssetTimelineOccurrences(asset.id);
               return (
                 <div
+                  id={`asset-item-${asset.id}`}
                   key={asset.id}
-                  className={`flex items-center gap-2 p-1.5 border rounded cursor-pointer transition-all group ${
-                    isAssetSelected ? 'border-cinema-ai bg-cinema-ai/10' : 'bg-cinema-850 border-cinema-border hover:border-cinema-ai/40'
+                  className={`flex items-center gap-2 p-1.5 border rounded cursor-pointer transition-all group relative ${
+                    isHighlighted
+                      ? 'border-amber-400 ring-2 ring-amber-400 animate-pulse bg-amber-950/30'
+                      : isAssetSelected
+                      ? 'border-cinema-ai bg-cinema-ai/10'
+                      : 'bg-cinema-850 border-cinema-border hover:border-cinema-ai/40'
                   }`}
                   onClick={() => setSelectedAssetId(isAssetSelected ? null : asset.id)}
+                  onDoubleClick={() => {
+                    loadSourceAsset(asset);
+                    showNotification(`Opened in Source Monitor: ${asset.file_name}`, 'info');
+                  }}
                   draggable
                   onDragStart={(e) => {
                     e.dataTransfer.setData('application/x-asset-id', asset.id);
@@ -315,10 +416,57 @@ export const MediaBrowserPanel: React.FC = () => {
                   {getTypeIcon(asset.asset_type)}
                   <div className="flex-1 min-w-0">
                     <p className="text-[11px] text-cinema-text truncate">{asset.file_name}</p>
-                    <p className="text-[9px] text-cinema-textDim">
-                      {formatSize(asset.file_size_bytes)}{asset.duration_ms ? ` • ${formatDuration(asset.duration_ms)}` : ''}
-                    </p>
+                    <div className="flex items-center gap-2">
+                      <p className="text-[9px] text-cinema-textDim">
+                        {formatSize(asset.file_size_bytes)}{asset.duration_ms ? ` • ${formatDuration(asset.duration_ms)}` : ''}
+                      </p>
+                      <button
+                        id={`asset-usage-badge-${asset.id}`}
+                        data-testid={`asset-usage-badge-${asset.id}`}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          if (occurrences.length > 0) {
+                            setActiveUsagePopoverId(activeUsagePopoverId === asset.id ? null : asset.id);
+                          }
+                        }}
+                        className={`px-1 py-0.2 rounded text-[8px] font-mono transition-colors ${
+                          occurrences.length > 0
+                            ? 'bg-emerald-950/85 text-emerald-300 border border-emerald-500/50 hover:bg-emerald-900/90'
+                            : 'bg-cinema-800 text-cinema-textDim/80 border border-cinema-border/40'
+                        }`}
+                      >
+                        {occurrences.length > 0 ? `Used (${occurrences.length})` : 'Unused'}
+                      </button>
+                    </div>
                   </div>
+                  {activeUsagePopoverId === asset.id && occurrences.length > 0 && (
+                    <div
+                      id={`asset-usage-popover-${asset.id}`}
+                      data-testid={`asset-usage-popover-${asset.id}`}
+                      className="absolute z-50 left-24 top-full mt-1 w-44 bg-cinema-900 border border-cinema-border rounded shadow-2xl p-1 text-[10px] text-cinema-text backdrop-blur-md"
+                      onClick={(e) => e.stopPropagation()}
+                    >
+                      <div className="text-[9px] text-cinema-textDim font-medium mb-1 px-1 border-b border-cinema-border/50 pb-0.5">
+                        Occurrences ({occurrences.length})
+                      </div>
+                      <div className="max-h-28 overflow-y-auto space-y-0.5">
+                        {occurrences.map((occ) => (
+                          <button
+                            key={occ.clipId}
+                            onClick={() => {
+                              jumpToTimelineOccurrence(occ.clipId);
+                              setActiveUsagePopoverId(null);
+                              showNotification(`Jumped to ${occ.trackName} at ${formatDuration(occ.startMs)}`, 'info');
+                            }}
+                            className="w-full text-left px-1.5 py-0.5 rounded bg-cinema-850 hover:bg-amber-950/70 hover:text-amber-200 transition-colors flex items-center justify-between text-[9px]"
+                          >
+                            <span className="truncate max-w-[80px] text-cinema-ai">[{occ.trackName}]</span>
+                            <span className="font-mono text-cinema-textDim">{formatDuration(occ.startMs)}</span>
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  )}
                   <button
                     className="p-0.5 opacity-0 group-hover:opacity-100 text-red-400 hover:text-red-300 transition-all"
                     onClick={(e) => { e.stopPropagation(); setDeleteConfirmId(asset.id); }}

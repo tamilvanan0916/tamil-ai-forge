@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import math
 import os
 import re
 import subprocess
@@ -372,6 +373,109 @@ class FFmpegService:
             logger.error(f"apply_transition error: {e}")
             return False
 
+    @staticmethod
+    def build_volume_automation_expression(keyframes: List[Dict[str, Any]], track_vol_db: float = 0.0) -> Optional[str]:
+        """
+        Builds a piecewise linear FFmpeg expression for volume=eval=frame:volume='...'.
+        Interpolates linear amplitude gain between sorted volume_db keyframes.
+        Returns None if no volume_db keyframes exist.
+        """
+        if not keyframes:
+            return None
+
+        vol_kfs = [
+            k for k in keyframes
+            if k.get("property_path") == "volume_db" and "time_offset_ms" in k and "value" in k
+        ]
+        if not vol_kfs:
+            return None
+
+        vol_kfs.sort(key=lambda k: k["time_offset_ms"])
+
+        if len(vol_kfs) == 1:
+            val_db = float(vol_kfs[0]["value"]) + track_vol_db
+            gain = max(0.0, 10.0 ** (val_db / 20.0))
+            return f"{gain:.4f}"
+
+        pts = []
+        for kf in vol_kfs:
+            t_sec = max(0.0, float(kf["time_offset_ms"]) / 1000.0)
+            v_db = float(kf["value"]) + track_vol_db
+            g = max(0.0, 10.0 ** (v_db / 20.0))
+            pts.append((t_sec, g))
+
+        last_t, last_g = pts[-1]
+        expr = f"{last_g:.4f}"
+
+        for i in range(len(pts) - 2, -1, -1):
+            t1, g1 = pts[i]
+            t2, g2 = pts[i + 1]
+            dt = t2 - t1
+            if dt <= 0.0001:
+                seg_expr = f"{g1:.4f}"
+            else:
+                seg_expr = f"({g1:.4f}+(t-{t1:.3f})/{dt:.3f}*({g2 - g1:.4f}))"
+            expr = f"if(lte(t,{t2:.3f}),{seg_expr},{expr})"
+
+        first_t, first_g = pts[0]
+        if first_t > 0.001:
+            expr = f"if(lte(t,{first_t:.3f}),{first_g:.4f},{expr})"
+
+        return expr
+
+    @staticmethod
+    def build_video_property_expression(
+        keyframes: List[Dict[str, Any]],
+        property_path: str,
+        default_val: float = 0.0,
+        time_var: str = "t",
+    ) -> Optional[str]:
+        """
+        Builds a piecewise linear FFmpeg expression for property_path keyframes over time (in seconds).
+        time_var is 't' for filters like scale, rotate, overlay or 'T' for geq.
+        Returns None if no keyframes for property_path exist.
+        """
+        if not keyframes:
+            return None
+
+        prop_kfs = [
+            k for k in keyframes
+            if k.get("property_path") == property_path and "time_offset_ms" in k and "value" in k
+        ]
+        if not prop_kfs:
+            return None
+
+        prop_kfs.sort(key=lambda k: k["time_offset_ms"])
+
+        if len(prop_kfs) == 1:
+            val = float(prop_kfs[0]["value"])
+            return f"{val:.4f}"
+
+        pts = []
+        for kf in prop_kfs:
+            t_sec = max(0.0, float(kf["time_offset_ms"]) / 1000.0)
+            val = float(kf["value"])
+            pts.append((t_sec, val))
+
+        last_t, last_val = pts[-1]
+        expr = f"{last_val:.4f}"
+
+        for i in range(len(pts) - 2, -1, -1):
+            t1, v1 = pts[i]
+            t2, v2 = pts[i + 1]
+            dt = t2 - t1
+            if dt <= 0.0001:
+                seg_expr = f"{v1:.4f}"
+            else:
+                seg_expr = f"({v1:.4f}+({time_var}-{t1:.3f})/{dt:.3f}*({v2 - v1:.4f}))"
+            expr = f"if(lte({time_var},{t2:.3f}),{seg_expr},{expr})"
+
+        first_t, first_val = pts[0]
+        if first_t > 0.001:
+            expr = f"if(lte({time_var},{first_t:.3f}),{first_val:.4f},{expr})"
+
+        return expr
+
     async def mix_audio_tracks(
         self,
         audio_inputs: List[Dict[str, Any]],
@@ -380,7 +484,7 @@ class FFmpegService:
     ) -> bool:
         """
         Mixes multiple audio tracks (dialogue, music, sfx) with per-track volume, fades, and delays.
-        audio_inputs format: [{'path': Path, 'volume': float, 'delay_ms': int, 'fade_in_ms': int, 'fade_out_ms': int}]
+        audio_inputs format: [{'path': Path, 'volume': float, 'delay_ms': int, 'fade_in_ms': int, 'fade_out_ms': int, 'keyframes': list}]
         """
         output_path.parent.mkdir(parents=True, exist_ok=True)
         if not audio_inputs:
@@ -405,8 +509,11 @@ class FFmpegService:
 
                 filters = ["aformat=sample_rates=48000:channel_layouts=stereo"]
 
-                # Volume & Gain
-                if vol != 1.0:
+                # Dynamic Automation or Static Volume Gain
+                auto_expr = self.build_volume_automation_expression(item.get("keyframes", []))
+                if auto_expr:
+                    filters.append(f"volume=eval=frame:volume='{auto_expr}'")
+                elif vol != 1.0:
                     filters.append(f"volume={vol}")
 
                 # Pan / Balance (-1.0 to 1.0)
@@ -611,6 +718,121 @@ class FFmpegService:
 
         return filters
 
+    @staticmethod
+    def build_xfade_transition_filter(transition_type: str, duration_sec: float, offset_sec: float) -> str:
+        """
+        Builds FFmpeg xfade filter expression for supported transition types:
+        - crossfade -> fade
+        - fade_black -> fadeblack
+        - fade_white -> fadewhite
+        """
+        mapping = {
+            "crossfade": "fade",
+            "fade_black": "fadeblack",
+            "fade_white": "fadewhite",
+        }
+        xfade_type = mapping.get(transition_type, "fade")
+        return f"xfade=transition={xfade_type}:duration={duration_sec:.3f}:offset={offset_sec:.3f}"
+
+    @staticmethod
+    def validate_clip_speed(speed: Any) -> float:
+        """
+        Validates clip playback speed factor.
+        Must be a positive float within [0.1, 10.0]. Default is 1.0.
+        """
+        allowed_presets = [0.25, 0.5, 1.0, 1.5, 2.0, 4.0]
+        try:
+            val = float(speed)
+            if not math.isfinite(val) or val <= 0:
+                return 1.0
+            for p in allowed_presets:
+                if abs(val - p) < 0.001:
+                    return p
+            if 0.1 <= val <= 10.0:
+                return round(val, 2)
+            return 1.0
+        except (ValueError, TypeError):
+            return 1.0
+
+    @staticmethod
+    def validate_clip_reverse(is_reversed: Any) -> bool:
+        """
+        Validates whether clip playback direction is reversed.
+        """
+        return bool(is_reversed)
+
+    @staticmethod
+    def build_speed_filter(speed: float) -> str:
+        """
+        Builds FFmpeg video setpts filter for speed factor.
+        Returns empty string if speed is 1.0.
+        """
+        if abs(speed - 1.0) < 0.001 or speed <= 0:
+            return ""
+        pts_factor = 1.0 / speed
+        return f"setpts={pts_factor:.4f}*PTS"
+
+    @staticmethod
+    def build_reverse_filter() -> str:
+        """
+        Builds FFmpeg video reverse filter.
+        """
+        return "reverse"
+
+    @staticmethod
+    def validate_freeze_duration(duration_ms: Any) -> int:
+        """
+        Validates freeze frame duration in milliseconds.
+        Supported values: 1000 (1s), 2000 (2s), 3000 (3s), 5000 (5s).
+        Defaults to 2000 if invalid or unrecognized.
+        """
+        try:
+            val = int(duration_ms)
+            if val in [1000, 2000, 3000, 5000]:
+                return val
+            return 2000
+        except (ValueError, TypeError):
+            return 2000
+
+    @staticmethod
+    def build_freeze_frame_filter(freeze_at_sec: float, freeze_duration_sec: float, fps: float = 30.0) -> str:
+        """
+        Builds native FFmpeg loop filter expression for freezing a single frame.
+        start_frame = round(freeze_at_sec * fps)
+        loop_frames = round(freeze_duration_sec * fps)
+        """
+        fps_val = max(1.0, float(fps))
+        start_frame = max(0, round(float(freeze_at_sec) * fps_val))
+        loop_frames = max(1, round(float(freeze_duration_sec) * fps_val))
+        return f"loop=loop={loop_frames}:size=1:start={start_frame},setpts=N/FRAME_RATE/TB"
+
+    @staticmethod
+    def validate_frame_hold_duration(duration_ms: Any) -> int:
+        """
+        Validates frame hold duration in milliseconds.
+        Supported values: 1000 (1s), 2000 (2s), 3000 (3s), 5000 (5s).
+        Defaults to 2000 if invalid or unrecognized.
+        """
+        try:
+            val = int(duration_ms)
+            if val in [1000, 2000, 3000, 5000]:
+                return val
+            return 2000
+        except (ValueError, TypeError):
+            return 2000
+
+    @staticmethod
+    def build_frame_hold_filter(hold_at_sec: float, hold_duration_sec: float, fps: float = 30.0) -> str:
+        """
+        Builds native FFmpeg setpts expression for holding a source frame at hold_at_sec
+        for hold_duration_sec while timeline continues forward.
+        """
+        start_sec = max(0.0, float(hold_at_sec))
+        dur_sec = max(0.1, float(hold_duration_sec))
+        end_sec = start_sec + dur_sec
+        fps_val = max(1.0, float(fps))
+        return f"setpts='if(between(T,{start_sec:.3f},{end_sec:.3f}),{start_sec:.3f}/TB,PTS)',fps={fps_val}"
+
     async def render_timeline_sequence(
         self,
         timeline_duration_ms: int,
@@ -692,38 +914,185 @@ class FFmpegService:
                 source_path = clip["file_path"]
                 start_sec = max(0.0, clip.get("source_in_ms", 0) / 1000.0)
                 dur_sec = max(0.1, clip.get("duration_ms", 1000) / 1000.0)
-                speed = clip.get("speed_factor", 1.0)
-                is_reversed = clip.get("is_reversed", False)
+                speed = FFmpegService.validate_clip_speed(clip.get("speed_factor", 1.0))
+                is_reversed = FFmpegService.validate_clip_reverse(clip.get("is_reversed", False))
+                is_frozen = bool(clip.get("is_frozen", False))
+                freeze_at_ms = clip.get("freeze_at_ms", 0)
+                freeze_at_sec = max(0.0, float(freeze_at_ms or 0) / 1000.0)
+                freeze_dur_ms = FFmpegService.validate_freeze_duration(clip.get("freeze_duration_ms", 2000))
+                freeze_dur_sec = float(freeze_dur_ms) / 1000.0
 
-                inputs_cmd.extend(["-ss", str(start_sec), "-t", str(dur_sec), "-i", str(source_path)])
+                is_frame_hold = bool(clip.get("is_frame_hold", False))
+                frame_hold_at_ms = clip.get("frame_hold_at_ms", 0)
+                frame_hold_at_sec = max(0.0, float(frame_hold_at_ms or 0) / 1000.0)
+                frame_hold_dur_ms = FFmpegService.validate_frame_hold_duration(clip.get("frame_hold_duration_ms", 2000))
+                frame_hold_dur_sec = float(frame_hold_dur_ms) / 1000.0
 
-                seg_vfilters = get_framing_filters(width, height, framing_mode)
-                if speed != 1.0 and speed > 0:
-                    seg_vfilters.append(f"setpts={1.0/speed}*PTS")
-                if is_reversed:
-                    seg_vfilters.append("reverse")
+                read_dur_sec = dur_sec * speed if (speed != 1.0 and speed > 0) else dur_sec
+                inputs_cmd.extend(["-ss", str(start_sec), "-t", str(read_dur_sec), "-i", str(source_path)])
 
-                color_meta = clip.get("color_grade") or (clip.get("metadata_info") or {}).get("color_grade")
-                if isinstance(color_meta, dict):
-                    seg_vfilters.extend(build_color_filter_chain(color_meta))
+                clip_kfs = clip.get("keyframes") or []
+                pos_x_expr = self.build_video_property_expression(clip_kfs, "position_x", time_var="t")
+                pos_y_expr = self.build_video_property_expression(clip_kfs, "position_y", time_var="t")
+                scale_x_expr = self.build_video_property_expression(clip_kfs, "scale_x", time_var="t")
+                scale_y_expr = self.build_video_property_expression(clip_kfs, "scale_y", time_var="t")
+                rot_expr = self.build_video_property_expression(clip_kfs, "rotation", time_var="t")
+                op_expr = self.build_video_property_expression(clip_kfs, "opacity", time_var="T")
 
-                vfx_effects = clip.get("effects") or (clip.get("metadata_info") or {}).get("effects")
-                if isinstance(vfx_effects, list):
-                    seg_vfilters.extend(build_vfx_filter_chain(vfx_effects))
+                has_motion_kfs = any([pos_x_expr, pos_y_expr, scale_x_expr, scale_y_expr, rot_expr, op_expr])
 
-                filter_chains.append(f"[{idx}:v]{','.join(seg_vfilters)}[v{idx}]")
+                static_pos_x = float(clip.get("position_x", 0.5) if clip.get("position_x") is not None else 0.5)
+                static_pos_y = float(clip.get("position_y", 0.5) if clip.get("position_y") is not None else 0.5)
+                static_scale_x = float(clip.get("scale_x", 1.0) if clip.get("scale_x") is not None else 1.0)
+                static_scale_y = float(clip.get("scale_y", 1.0) if clip.get("scale_y") is not None else 1.0)
+                static_rot = float(clip.get("rotation", 0.0) if clip.get("rotation") is not None else 0.0)
+                static_op = float(clip.get("opacity", 1.0) if clip.get("opacity") is not None else 1.0)
+
+                has_custom_transform = (
+                    has_motion_kfs
+                    or abs(static_pos_x - 0.5) > 0.001
+                    or abs(static_pos_y - 0.5) > 0.001
+                    or abs(static_scale_x - 1.0) > 0.001
+                    or abs(static_scale_y - 1.0) > 0.001
+                    or abs(static_rot) > 0.01
+                    or abs(static_op - 1.0) > 0.001
+                )
+
+                if not has_custom_transform:
+                    # Preserve exact existing static transform rendering path when no custom transforms exist
+                    seg_vfilters = get_framing_filters(width, height, framing_mode)
+                    if is_frozen:
+                        seg_vfilters.append(FFmpegService.build_freeze_frame_filter(freeze_at_sec, freeze_dur_sec, fps))
+                    elif is_frame_hold:
+                        seg_vfilters.append(FFmpegService.build_frame_hold_filter(frame_hold_at_sec, frame_hold_dur_sec, fps))
+                    if speed != 1.0 and speed > 0:
+                        seg_vfilters.append(FFmpegService.build_speed_filter(speed))
+                    if is_reversed:
+                        seg_vfilters.append(FFmpegService.build_reverse_filter())
+                    if speed != 1.0 or is_reversed or is_frozen or is_frame_hold:
+                        seg_vfilters.append(f"trim=duration={dur_sec:.3f},setpts=PTS-STARTPTS,fps={fps}")
+
+                    color_meta = clip.get("color_grade") or (clip.get("metadata_info") or {}).get("color_grade")
+                    if isinstance(color_meta, dict):
+                        seg_vfilters.extend(build_color_filter_chain(color_meta))
+
+                    vfx_effects = clip.get("effects") or (clip.get("metadata_info") or {}).get("effects")
+                    if isinstance(vfx_effects, list):
+                        seg_vfilters.extend(build_vfx_filter_chain(vfx_effects))
+
+                    filter_chains.append(f"[{idx}:v]{','.join(seg_vfilters)}[v{idx}]")
+                else:
+                    # Video keyframe & transform animation rendering path
+                    seg_vfilters = [
+                        f"scale={width}:{height}:force_original_aspect_ratio=decrease",
+                        f"fps={fps}",
+                        "format=yuv420p"
+                    ]
+                    if is_frozen:
+                        seg_vfilters.append(FFmpegService.build_freeze_frame_filter(freeze_at_sec, freeze_dur_sec, fps))
+                    elif is_frame_hold:
+                        seg_vfilters.append(FFmpegService.build_frame_hold_filter(frame_hold_at_sec, frame_hold_dur_sec, fps))
+                    if speed != 1.0 and speed > 0:
+                        seg_vfilters.append(FFmpegService.build_speed_filter(speed))
+                    if is_reversed:
+                        seg_vfilters.append(FFmpegService.build_reverse_filter())
+                    if speed != 1.0 or is_reversed or is_frozen or is_frame_hold:
+                        seg_vfilters.append(f"trim=duration={dur_sec:.3f},setpts=PTS-STARTPTS,fps={fps}")
+
+                    color_meta = clip.get("color_grade") or (clip.get("metadata_info") or {}).get("color_grade")
+                    if isinstance(color_meta, dict):
+                        seg_vfilters.extend(build_color_filter_chain(color_meta))
+
+                    vfx_effects = clip.get("effects") or (clip.get("metadata_info") or {}).get("effects")
+                    if isinstance(vfx_effects, list):
+                        seg_vfilters.extend(build_vfx_filter_chain(vfx_effects))
+
+                    # Scale animation / static
+                    if scale_x_expr or scale_y_expr:
+                        sx = scale_x_expr or f"{static_scale_x:.4f}"
+                        sy = scale_y_expr or f"{static_scale_y:.4f}"
+                        seg_vfilters.append(f"scale=eval=frame:w='trunc(iw*({sx})/2)*2':h='trunc(ih*({sy})/2)*2'")
+                    elif abs(static_scale_x - 1.0) > 0.001 or abs(static_scale_y - 1.0) > 0.001:
+                        seg_vfilters.append(f"scale=w='trunc(iw*{static_scale_x:.4f}/2)*2':h='trunc(ih*{static_scale_y:.4f}/2)*2'")
+
+                    # Rotation animation / static
+                    if rot_expr:
+                        seg_vfilters.append(f"rotate=a='({rot_expr})*PI/180':fillcolor=black@0")
+                    elif abs(static_rot) > 0.01:
+                        seg_vfilters.append(f"rotate=a={static_rot:.4f}*PI/180:fillcolor=black@0")
+
+                    # Opacity animation / static
+                    if op_expr:
+                        seg_vfilters.append(f"format=yuva420p,geq=lum='p(X,Y)':a='255*({op_expr})'")
+                    elif abs(static_op - 1.0) > 0.001:
+                        seg_vfilters.append(f"format=yuva420p,colorchannelmixer=aa={static_op:.4f}")
+
+                    # Position overlay over black canvas
+                    px = pos_x_expr or f"{static_pos_x:.4f}"
+                    py = pos_y_expr or f"{static_pos_y:.4f}"
+
+                    filter_chains.append(f"[{idx}:v]{','.join(seg_vfilters)}[v_xf{idx}]")
+                    filter_chains.append(f"color=c=black:s={width}x{height}:r={fps}:d={dur_sec}[c_bg{idx}]")
+                    filter_chains.append(f"[c_bg{idx}][v_xf{idx}]overlay=x='(W-w)/2+(({px})-0.5)*W':y='(H-h)/2+(({py})-0.5)*H':eval=frame,format=yuv420p[v{idx}]")
 
                 # Check if video has audio stream
                 probe_res = await self.probe_media(Path(source_path))
                 if probe_res.get("codec_audio"):
-                    filter_chains.append(f"[{idx}:a]aformat=sample_rates=48000:channel_layouts=stereo[a{idx}]")
+                    if speed != 1.0 or is_reversed or is_frozen or is_frame_hold:
+                        filter_chains.append(f"[{idx}:a]atrim=duration={dur_sec:.3f},asetpts=PTS-STARTPTS,aformat=sample_rates=48000:channel_layouts=stereo[a{idx}]")
+                    else:
+                        filter_chains.append(f"[{idx}:a]aformat=sample_rates=48000:channel_layouts=stereo[a{idx}]")
                 else:
                     filter_chains.append(f"aevalsrc=0:d={dur_sec}:s=48000:c=stereo[a{idx}]")
 
                 segment_labels.append(f"[v{idx}][a{idx}]")
 
-            concat_in = "".join(segment_labels)
-            filter_chains.append(f"{concat_in}concat=n={len(video_clips)}:v=1:a=1[v_concat][v_audio_concat]")
+            # Check if any adjacent video clips have transitions configured
+            has_transitions = any(
+                bool(c.get("transition_out") and isinstance(c.get("transition_out"), dict) and c.get("transition_out").get("type") in ["crossfade", "fade_black", "fade_white"])
+                for c in video_clips
+            )
+
+            if not has_transitions or len(video_clips) <= 1:
+                # Preserve existing static concat path when no transitions exist
+                concat_in = "".join(segment_labels)
+                filter_chains.append(f"{concat_in}concat=n={len(video_clips)}:v=1:a=1[v_concat][v_audio_concat]")
+            else:
+                # Assemble multi-clip sequence with xfade & acrossfade transitions
+                current_v = "[v0]"
+                current_a = "[a0]"
+                accum_dur = max(0.1, video_clips[0].get("duration_ms", 1000) / 1000.0)
+
+                for i in range(len(video_clips) - 1):
+                    next_dur = max(0.1, video_clips[i + 1].get("duration_ms", 1000) / 1000.0)
+                    trans = video_clips[i].get("transition_out")
+
+                    v_target = f"[v_xfade_{i}]" if i < len(video_clips) - 2 else "[v_concat]"
+                    a_target = f"[a_xfade_{i}]" if i < len(video_clips) - 2 else "[v_audio_concat]"
+
+                    if trans and isinstance(trans, dict) and trans.get("type") in ["crossfade", "fade_black", "fade_white"]:
+                        t_type = trans.get("type")
+                        raw_dur = float(trans.get("duration_ms", 1000)) / 1000.0
+                        t_dur = min(accum_dur, next_dur, max(0.05, raw_dur))
+                        offset = max(0.0, accum_dur - t_dur)
+
+                        xfade_str = FFmpegService.build_xfade_transition_filter(t_type, t_dur, offset)
+                        filter_chains.append(f"{current_v}[v{i+1}]{xfade_str}{v_target}")
+                        filter_chains.append(f"{current_a}[a{i+1}]acrossfade=d={t_dur:.3f}{a_target}")
+
+                        accum_dur = accum_dur + next_dur - t_dur
+                    else:
+                        # Adjacent cut without transition: micro crossfade to maintain stream continuity
+                        micro = 0.001
+                        offset = max(0.0, accum_dur - micro)
+
+                        filter_chains.append(f"{current_v}[v{i+1}]xfade=transition=fade:duration={micro:.4f}:offset={offset:.4f}{v_target}")
+                        filter_chains.append(f"{current_a}[a{i+1}]acrossfade=d={micro:.4f}{a_target}")
+
+                        accum_dur = accum_dur + next_dur - micro
+
+                    current_v = v_target
+                    current_a = a_target
 
             if burn_subs and subtitles_path and Path(subtitles_path).exists():
                 escaped_sub = str(subtitles_path).replace("\\", "/").replace(":", r"\:").replace("'", "")
@@ -764,12 +1133,59 @@ class FFmpegService:
             inputs_cmd.extend(["-ss", str(a_in), "-t", str(a_dur), "-i", str(a_path)])
 
             af_filters = ["aformat=sample_rates=48000:channel_layouts=stereo"]
-            if abs(a_gain - 1.0) > 0.001:
+            auto_expr = self.build_volume_automation_expression(
+                a_clip.get("keyframes", []),
+                track_vol_db=float(a_clip.get("track_volume_db", 0.0) or 0.0)
+            )
+            if auto_expr:
+                af_filters.append(f"volume=eval=frame:volume='{auto_expr}'")
+            elif abs(a_gain - 1.0) > 0.001:
                 af_filters.append(f"volume={a_gain:.4f}")
             if a_fade_in > 0:
                 af_filters.append(f"afade=t=in:ss=0:d={a_fade_in:.3f}")
             if a_fade_out > 0:
                 af_filters.append(f"afade=t=out:st={max(0.0, a_dur - a_fade_out):.3f}:d={a_fade_out:.3f}")
+
+            # Stereo pan support
+            a_pan = float(a_clip.get("pan", 0.0) or 0.0)
+            a_pan = max(-1.0, min(1.0, a_pan))
+            if abs(a_pan) > 0.01:
+                c0_gain = max(0.0, min(1.0, 1.0 - a_pan)) if a_pan > 0 else 1.0
+                c1_gain = max(0.0, min(1.0, 1.0 + a_pan)) if a_pan < 0 else 1.0
+                af_filters.append(f"pan=stereo|c0={c0_gain:.2f}*c0|c1={c1_gain:.2f}*c1")
+
+            # 5-Band Equalizer support
+            meta = a_clip.get("metadata_info") or {}
+            eq = meta.get("equalizer")
+            if isinstance(eq, dict):
+                eq_bands = [
+                    (80, eq.get("low_80", 0)),
+                    (250, eq.get("low_mid_250", 0)),
+                    (1000, eq.get("mid_1000", 0)),
+                    (4000, eq.get("high_mid_4000", 0)),
+                    (12000, eq.get("high_12000", 0)),
+                ]
+                for freq, gain in eq_bands:
+                    try:
+                        g_val = float(gain)
+                        if abs(g_val) > 0.1:
+                            af_filters.append(f"equalizer=f={freq}:width_type=q:w=1.0:g={g_val:.1f}")
+                    except (ValueError, TypeError):
+                        pass
+
+            # Dynamics compressor support
+            comp = meta.get("compressor")
+            if isinstance(comp, dict) and comp.get("enabled", False):
+                try:
+                    thresh = float(comp.get("threshold", -20))
+                    ratio = float(comp.get("ratio", 4))
+                    attack = float(comp.get("attack", 20))
+                    release = float(comp.get("release", 250))
+                    makeup = float(comp.get("makeup_gain", 0))
+                    af_filters.append(f"acompressor=threshold={thresh:.1f}dB:ratio={ratio:.1f}:attack={attack:.1f}:release={release:.1f}:makeup={makeup:.1f}dB")
+                except (ValueError, TypeError):
+                    pass
+
             if a_start_ms > 0:
                 af_filters.append(f"adelay={a_start_ms}|{a_start_ms}")
 
@@ -792,6 +1208,7 @@ class FFmpegService:
             "-filter_complex", ";".join(filter_chains),
             "-map", "[outv]",
             "-map", "[outa]",
+            "-t", f"{total_duration_sec:.3f}",
             "-c:v", video_codec, "-preset", "veryfast", "-crf", str(crf),
             "-c:a", audio_codec, "-b:a", audio_bitrate,
             "-progress", "pipe:1",

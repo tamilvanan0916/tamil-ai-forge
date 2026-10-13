@@ -1,5 +1,6 @@
 from typing import Optional, List, Dict, Any
-from pydantic import BaseModel, ConfigDict
+from enum import Enum
+from pydantic import BaseModel, ConfigDict, Field
 from datetime import datetime
 
 # --- Story Schemas ---
@@ -251,3 +252,67 @@ class AIMusicGenRequest(BaseModel):
     genre: Optional[str] = "Cinematic"
     mood: Optional[str] = "Cinematic"
     duration_sec: float = 30.0
+
+
+# --- Phase 19: AI Editing Assistant / Prompt-to-Edit Schemas ---
+
+class EditOperationType(str, Enum):
+    TRIM = "trim"
+    SPLIT = "split"
+    DELETE = "delete"
+    RIPPLE_DELETE = "ripple_delete"
+    MOVE = "move"
+    TRANSITION = "transition"
+    VOLUME = "volume"
+    MUTE = "mute"
+    TITLE = "title"
+    CAPTION = "caption"
+    DURATION = "duration"
+
+class EditPlanStatus(str, Enum):
+    READY_FOR_REVIEW = "ready_for_review"
+    AMBIGUOUS = "ambiguous"
+    UNSUPPORTED = "unsupported"
+    INVALID = "invalid"
+
+class EditOperation(BaseModel):
+    id: str
+    type: EditOperationType
+    operation_type: Optional[EditOperationType] = None
+    operation_id: Optional[str] = None
+    target_type: str = "clip"  # clip | track | timeline
+    target_id: Optional[str] = None
+    target_name: Optional[str] = None
+    track_id: Optional[str] = None
+    description: str
+    parameters: Dict[str, Any] = {}
+
+    def model_post_init(self, __context: Any) -> None:
+        if self.operation_type is None:
+            self.operation_type = self.type
+        if self.operation_id is None:
+            self.operation_id = self.id
+
+class EditPlanRequest(BaseModel):
+    project_id: str
+    prompt: str
+    selected_clip_id: Optional[str] = None
+    selected_track_id: Optional[str] = None
+    playhead_ms: Optional[int] = 0
+    timeline_context: Optional[Dict[str, Any]] = None
+
+class EditPlan(BaseModel):
+    plan_id: str
+    request: str
+    summary: str
+    confidence: float = Field(default=1.0, ge=0.0, le=1.0)
+    status: EditPlanStatus = EditPlanStatus.READY_FOR_REVIEW
+    is_valid: bool = True
+    validation_errors: List[str] = []
+    requires_confirmation: bool = True
+    operations: List[EditOperation] = []
+    clarification_prompt: Optional[str] = None
+
+class EditPlanResponse(BaseModel):
+    success: bool
+    plan: EditPlan

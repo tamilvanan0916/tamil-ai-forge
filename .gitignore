@@ -55,12 +55,19 @@ storage/projects/
 storage/temp/
 storage/media/
 storage/exports/
+storage/test_media_suite/
+storage/*.db*
 
 backend/storage/cache/
 backend/storage/projects/
 backend/storage/temp/
 backend/storage/media/
 backend/storage/exports/
+backend/storage/test/
+backend/storage/*.db*
+
+# Test Screenshots & Run Artifacts
+scripts/*.png
 
 # Scratch & Temporary
 scratch/

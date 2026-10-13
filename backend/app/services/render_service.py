@@ -114,8 +114,18 @@ class RenderService:
                 graphics_clips = []
 
                 if timeline and timeline.tracks:
+                    # Check if any audio track has is_solo = True
+                    has_solo_audio = any(
+                        bool(getattr(t, 'is_solo', False)) for t in timeline.tracks
+                        if t.track_type == 'audio' or getattr(t, 'track_role', '') in ['dialogue', 'voiceover', 'music', 'sfx', 'ambience']
+                    )
+
                     for track in sorted(timeline.tracks, key=lambda t: t.order_index):
                         if track.is_muted or not track.is_visible:
+                            continue
+
+                        is_audio_track = (track.track_type == 'audio' or getattr(track, 'track_role', '') in ['dialogue', 'voiceover', 'music', 'sfx', 'ambience'])
+                        if is_audio_track and has_solo_audio and not getattr(track, 'is_solo', False):
                             continue
 
                         is_graphics_track = (getattr(track, 'track_role', '') == 'graphics' or track.name.lower() == 'graphics')
@@ -145,6 +155,23 @@ class RenderService:
                                         if local_path.exists():
                                             track_vol = getattr(track, 'volume_db', 0.0) or 0.0
                                             clip_vol = getattr(clip, 'volume_db', 0.0) or 0.0
+                                            track_pan = getattr(track, 'pan', 0.0) or 0.0
+                                            clip_meta = clip.metadata_info or {}
+                                            clip_pan = clip_meta.get('pan', 0.0) if isinstance(clip_meta, dict) else 0.0
+                                            pan_val = float(track_pan if abs(track_pan) > 0.001 else clip_pan)
+                                            pan_val = max(-1.0, min(1.0, pan_val))
+
+                                            keyframes_list = [
+                                                {
+                                                    "id": kf.id,
+                                                    "property_path": kf.property_path,
+                                                    "time_offset_ms": kf.time_offset_ms,
+                                                    "value": kf.value,
+                                                    "interpolation": getattr(kf, 'interpolation', 'linear'),
+                                                }
+                                                for kf in (getattr(clip, 'keyframes', []) or [])
+                                            ]
+
                                             clip_info = {
                                                 "file_path": local_path,
                                                 "start_time_ms": clip.start_time_ms,
@@ -153,10 +180,30 @@ class RenderService:
                                                 "source_out_ms": clip.source_out_ms,
                                                 "speed_factor": clip.speed_factor,
                                                 "is_reversed": clip.is_reversed,
+                                                "is_frozen": getattr(clip, "is_frozen", False),
+                                                "freeze_at_ms": getattr(clip, "freeze_at_ms", None),
+                                                "freeze_duration_ms": getattr(clip, "freeze_duration_ms", 2000),
+                                                "is_frame_hold": getattr(clip, "is_frame_hold", clip_meta.get("is_frame_hold", False)),
+                                                "frame_hold_at_ms": getattr(clip, "frame_hold_at_ms", clip_meta.get("frame_hold_at_ms")),
+                                                "frame_hold_duration_ms": getattr(clip, "frame_hold_duration_ms", clip_meta.get("frame_hold_duration_ms", 2000)),
+                                                "track_volume_db": track_vol,
+                                                "clip_volume_db": clip_vol,
                                                 "volume_db": track_vol + clip_vol,
+                                                "pan": pan_val,
                                                 "fade_in_ms": clip.fade_in_ms,
                                                 "fade_out_ms": clip.fade_out_ms,
                                                 "track_role": getattr(track, 'track_role', 'audio') or 'audio',
+                                                "position_x": getattr(clip, "position_x", 0.5),
+                                                "position_y": getattr(clip, "position_y", 0.5),
+                                                "scale_x": getattr(clip, "scale_x", 1.0),
+                                                "scale_y": getattr(clip, "scale_y", 1.0),
+                                                "rotation": getattr(clip, "rotation", 0.0),
+                                                "opacity": getattr(clip, "opacity", 1.0),
+                                                "id": clip.id,
+                                                "transition_in": getattr(clip, "transition_in", None),
+                                                "transition_out": getattr(clip, "transition_out", None),
+                                                "metadata_info": clip_meta,
+                                                "keyframes": keyframes_list,
                                             }
                                             if track.track_type == "video":
                                                 video_clips.append(clip_info)

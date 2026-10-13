@@ -1,5 +1,6 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { useTimelineStore } from '../../stores/useTimelineStore';
+import { audioPreviewEngine } from '../../services/audioPreviewEngine';
 
 interface AudioMeterProps {
   compact?: boolean;
@@ -7,7 +8,7 @@ interface AudioMeterProps {
 }
 
 export const AudioMeter: React.FC<AudioMeterProps> = ({ compact = false, className = '' }) => {
-  const { isPlaying } = useTimelineStore();
+  const { isPlaying, playheadMs, timeline } = useTimelineStore();
   const [leftDb, setLeftDb] = useState(-60);
   const [rightDb, setRightDb] = useState(-60);
   const [leftPeakHold, setLeftPeakHold] = useState(-60);
@@ -15,9 +16,7 @@ export const AudioMeter: React.FC<AudioMeterProps> = ({ compact = false, classNa
   const [isClipped, setIsClipped] = useState(false);
 
   const rafRef = useRef<number | null>(null);
-  const peakHoldTimerRef = useRef<
-    { left: number; right: number }
-  >({ left: 0, right: 0 });
+  const peakHoldTimerRef = useRef<{ left: number; right: number }>({ left: 0, right: 0 });
 
   useEffect(() => {
     let currentLeft = -60;
@@ -26,40 +25,72 @@ export const AudioMeter: React.FC<AudioMeterProps> = ({ compact = false, classNa
     let peakRight = -60;
 
     const animate = (timestamp: number) => {
-      if (isPlaying) {
-        const base = -16;
-        const wave1 = Math.sin(timestamp * 0.008) * 8;
-        const wave2 = Math.cos(timestamp * 0.003) * 6;
-        const noise = (Math.random() - 0.5) * 4;
+      const state = useTimelineStore.getState();
+      const isPlay = state.isPlaying;
+      const playhead = state.playheadMs;
+      const tl = state.timeline;
 
-        const targetLeft = Math.max(-60, Math.min(2, base + wave1 + noise));
-        const targetRight = Math.max(-60, Math.min(2, base + wave2 + (Math.random() - 0.5) * 4));
+      let targetLeft = -60;
+      let targetRight = -60;
 
-        currentLeft = targetLeft > currentLeft ? targetLeft : currentLeft - 0.8;
-        currentRight = targetRight > currentRight ? targetRight : currentRight - 0.8;
+      if (isPlay && tl?.tracks) {
+        // Collect active eligible audio clips
+        const isAnySolo = tl.tracks.some(
+          (t) =>
+            (t.track_type === 'audio' ||
+              ['dialogue', 'voiceover', 'music', 'sfx', 'ambience'].includes(t.track_role)) &&
+            t.is_solo
+        );
 
-        if (currentLeft > peakLeft) {
-          peakLeft = currentLeft;
-          peakHoldTimerRef.current.left = timestamp + 1200;
-        } else if (timestamp > peakHoldTimerRef.current.left) {
-          peakLeft = Math.max(-60, peakLeft - 1.2);
+        const activeTracks = [];
+        for (const track of tl.tracks) {
+          const isAudio =
+            track.track_type === 'audio' ||
+            ['dialogue', 'voiceover', 'music', 'sfx', 'ambience'].includes(track.track_role);
+          if (!isAudio) continue;
+          if (isAnySolo && !track.is_solo) continue;
+          if (track.is_muted) continue;
+
+          const clip = track.clips.find(
+            (c) => c.start_time_ms <= playhead && playhead < c.start_time_ms + c.duration_ms
+          );
+          if (clip) {
+            activeTracks.push({
+              trackId: track.id,
+              clip,
+              trackVolumeDb: track.volume_db ?? 0,
+              pan: track.pan ?? 0,
+            });
+          }
         }
 
-        if (currentRight > peakRight) {
-          peakRight = currentRight;
-          peakHoldTimerRef.current.right = timestamp + 1200;
-        } else if (timestamp > peakHoldTimerRef.current.right) {
-          peakRight = Math.max(-60, peakRight - 1.2);
-        }
-
-        if (currentLeft >= 0 || currentRight >= 0) {
+        const levels = audioPreviewEngine.getMeterLevels(activeTracks, playhead);
+        targetLeft = levels.left;
+        targetRight = levels.right;
+        if (levels.isClipped) {
           setIsClipped(true);
         }
-      } else {
-        currentLeft = Math.max(-60, currentLeft - 2.5);
-        currentRight = Math.max(-60, currentRight - 2.5);
-        peakLeft = Math.max(-60, peakLeft - 2.5);
-        peakRight = Math.max(-60, peakRight - 2.5);
+      }
+
+      currentLeft = targetLeft > currentLeft ? targetLeft : currentLeft - 0.8;
+      currentRight = targetRight > currentRight ? targetRight : currentRight - 0.8;
+
+      if (currentLeft > peakLeft) {
+        peakLeft = currentLeft;
+        peakHoldTimerRef.current.left = timestamp + 1200;
+      } else if (timestamp > peakHoldTimerRef.current.left) {
+        peakLeft = Math.max(-60, peakLeft - 1.2);
+      }
+
+      if (currentRight > peakRight) {
+        peakRight = currentRight;
+        peakHoldTimerRef.current.right = timestamp + 1200;
+      } else if (timestamp > peakHoldTimerRef.current.right) {
+        peakRight = Math.max(-60, peakRight - 1.2);
+      }
+
+      if (currentLeft >= 0 || currentRight >= 0) {
+        setIsClipped(true);
       }
 
       setLeftDb(Math.round(currentLeft * 10) / 10);
@@ -127,7 +158,11 @@ export const AudioMeter: React.FC<AudioMeterProps> = ({ compact = false, classNa
         </div>
         <button
           type="button"
-          onClick={() => setIsClipped(false)}
+          data-testid="audio-meter-compact-clip"
+          onClick={() => {
+            setIsClipped(false);
+            audioPreviewEngine.resetClipping();
+          }}
           title={isClipped ? 'Audio Clipped (>0dB). Click to reset.' : 'Peak Normal'}
           className={`w-1.5 h-3 rounded-xs transition-colors ${
             isClipped ? 'bg-red-500 animate-pulse' : 'bg-cinema-border/50'
@@ -143,7 +178,11 @@ export const AudioMeter: React.FC<AudioMeterProps> = ({ compact = false, classNa
         <span className="font-semibold text-cinema-text">MASTER BUS (L/R)</span>
         <button
           type="button"
-          onClick={() => setIsClipped(false)}
+          data-testid="audio-meter-clip-indicator"
+          onClick={() => {
+            setIsClipped(false);
+            audioPreviewEngine.resetClipping();
+          }}
           className={`px-1 rounded text-[9px] font-bold ${
             isClipped ? 'bg-red-950 text-red-400 border border-red-800' : 'text-cinema-textMuted'
           }`}

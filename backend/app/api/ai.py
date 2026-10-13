@@ -12,8 +12,10 @@ from app.schemas.ai_schemas import (
     SceneCreateSchema, SceneUpdateSchema, SceneResponse,
     StoryboardReorderRequest, StoryboardShotResponse,
     AIJobResponse, ProviderConfigUpdateSchema, ProviderConfigResponse,
-    AIGenerateVideoRequest, AIVideoWorkflowRequest, AITTSRequest, AILipSyncRequest, AIMusicGenRequest
+    AIGenerateVideoRequest, AIVideoWorkflowRequest, AITTSRequest, AILipSyncRequest, AIMusicGenRequest,
+    EditPlanRequest, EditPlanResponse
 )
+from app.services.ai_editing_assistant import AIEditingAssistant
 from app.ai.registry import (
     AIRegistry, get_capability_status, update_provider_api_key, is_capability_configured
 )
@@ -308,4 +310,18 @@ async def configure_provider(data: ProviderConfigUpdateSchema):
         is_configured=status_info["is_configured"],
         model_name=data.model_name,
         message=f"Provider for {data.capability} configured successfully server-side."
+    )
+
+
+# --- Phase 19: AI Editing Assistant / Prompt-to-Edit ---
+@router.post("/editing-plan", response_model=EditPlanResponse)
+async def generate_editing_plan(data: EditPlanRequest):
+    """
+    Parses natural language edit requests into a structured, previewable edit plan.
+    Does not mutate timeline directly until user reviews and approves.
+    """
+    plan = AIEditingAssistant.parse_and_plan(data)
+    return EditPlanResponse(
+        success=plan.is_valid,
+        plan=plan
     )

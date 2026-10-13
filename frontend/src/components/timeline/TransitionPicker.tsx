@@ -2,18 +2,18 @@ import React, { useState, useRef, useEffect } from 'react';
 import { X } from 'lucide-react';
 import { useTimelineStore } from '../../stores/useTimelineStore';
 
-const TRANSITIONS = [
-  { type: 'cut', label: 'Cut', description: 'Instant, no transition' },
-  { type: 'cross_dissolve', label: 'Cross Dissolve', description: 'Blend between clips' },
-  { type: 'fade_from_black', label: 'Fade from Black', description: 'Fades in from black' },
-  { type: 'fade_to_black', label: 'Fade to Black', description: 'Fades out to black' },
-  { type: 'dip_to_black', label: 'Dip to Black', description: 'Dips through black' },
-  { type: 'dip_to_white', label: 'Dip to White', description: 'Dips through white' },
+import { VideoTransitionType } from '../../types';
+
+const TRANSITIONS: Array<{ type: VideoTransitionType | 'cut'; label: string; description: string }> = [
+  { type: 'crossfade', label: 'Crossfade', description: 'Smooth blend between clips' },
+  { type: 'fade_black', label: 'Fade Through Black', description: 'Dips through black between clips' },
+  { type: 'fade_white', label: 'Fade Through White', description: 'Dips through white between clips' },
+  { type: 'cut', label: 'Cut (None)', description: 'Instant cut, remove transition' },
 ];
 
 interface TransitionPickerProps {
-  clipAId: string; // clip whose out-transition we're setting
-  clipBId: string; // clip whose in-transition we're setting
+  clipAId: string; // outgoing clip
+  clipBId: string; // incoming clip
   position: { x: number; y: number };
   currentType?: string;
   currentDurationMs?: number;
@@ -25,12 +25,36 @@ export const TransitionPicker: React.FC<TransitionPickerProps> = ({
   clipBId,
   position,
   currentType,
-  currentDurationMs = 500,
+  currentDurationMs = 1000,
   onClose,
 }) => {
-  const { setClipTransition } = useTimelineStore();
-  const [selectedType, setSelectedType] = useState(currentType || 'cross_dissolve');
-  const [durationMs, setDurationMs] = useState(currentDurationMs);
+  const { applyVideoTransition, removeVideoTransition, setClipTransition, timeline } = useTimelineStore();
+
+  // Calculate max allowed duration from clip durations
+  let maxDuration = 2000;
+  if (timeline) {
+    let clipA, clipB;
+    for (const track of timeline.tracks) {
+      if (!clipA) clipA = track.clips.find((c) => c.id === clipAId);
+      if (!clipB) clipB = track.clips.find((c) => c.id === clipBId);
+    }
+    if (clipA && clipB) {
+      maxDuration = Math.min(clipA.duration_ms, clipB.duration_ms);
+    } else if (clipA) {
+      maxDuration = clipA.duration_ms;
+    }
+  }
+
+  const initialType = (currentType === 'cross_dissolve' || currentType === 'crossfade')
+    ? 'crossfade'
+    : (currentType === 'fade_black' || currentType === 'dip_to_black' || currentType === 'fade_to_black')
+    ? 'fade_black'
+    : (currentType === 'fade_white' || currentType === 'dip_to_white')
+    ? 'fade_white'
+    : 'crossfade';
+
+  const [selectedType, setSelectedType] = useState<VideoTransitionType | 'cut'>(initialType);
+  const [durationMs, setDurationMs] = useState(Math.min(currentDurationMs, maxDuration));
   const ref = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -45,19 +69,29 @@ export const TransitionPicker: React.FC<TransitionPickerProps> = ({
 
   const handleApply = () => {
     if (selectedType === 'cut') {
-      setClipTransition(clipAId, 'out', null);
-      setClipTransition(clipBId, 'in', null);
+      if (clipAId && clipBId && clipAId !== clipBId) {
+        removeVideoTransition(clipAId, clipBId);
+      } else {
+        setClipTransition(clipAId, 'out', null);
+      }
     } else {
-      const config = { type: selectedType, duration_ms: durationMs };
-      setClipTransition(clipAId, 'out', config);
-      setClipTransition(clipBId, 'in', config);
+      const clampedDuration = Math.max(100, Math.min(durationMs, maxDuration));
+      if (clipAId && clipBId && clipAId !== clipBId) {
+        applyVideoTransition(clipAId, clipBId, selectedType, clampedDuration);
+      } else {
+        const config = { type: selectedType, duration_ms: clampedDuration };
+        setClipTransition(clipAId, 'out', config);
+      }
     }
     onClose();
   };
 
   const handleRemove = () => {
-    setClipTransition(clipAId, 'out', null);
-    setClipTransition(clipBId, 'in', null);
+    if (clipAId && clipBId && clipAId !== clipBId) {
+      removeVideoTransition(clipAId, clipBId);
+    } else {
+      setClipTransition(clipAId, 'out', null);
+    }
     onClose();
   };
 

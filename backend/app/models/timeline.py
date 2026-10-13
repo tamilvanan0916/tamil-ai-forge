@@ -112,6 +112,60 @@ class Clip(Base):
             return self.metadata_info.get("color_grade")
         return None
 
+    @property
+    def group_id(self):
+        if isinstance(self.metadata_info, dict):
+            return self.metadata_info.get("group_id")
+        return None
+
+    @property
+    def linked_clip_id(self):
+        if isinstance(self.metadata_info, dict):
+            return self.metadata_info.get("linked_clip_id")
+        return None
+
+    @property
+    def is_compound(self):
+        if isinstance(self.metadata_info, dict):
+            return bool(self.metadata_info.get("is_compound", False))
+        return False
+
+    @property
+    def nested_tracks(self):
+        if isinstance(self.metadata_info, dict):
+            return self.metadata_info.get("nested_tracks")
+        return None
+
+    @property
+    def markers(self):
+        if isinstance(self.metadata_info, dict):
+            return self.metadata_info.get("markers", [])
+        return []
+
+    @property
+    def is_frame_hold(self):
+        if isinstance(self.metadata_info, dict):
+            return bool(self.metadata_info.get("is_frame_hold", False))
+        return False
+
+    @property
+    def frame_hold_at_ms(self):
+        if isinstance(self.metadata_info, dict):
+            return self.metadata_info.get("frame_hold_at_ms")
+        return None
+
+    @property
+    def frame_hold_duration_ms(self):
+        if isinstance(self.metadata_info, dict):
+            return self.metadata_info.get("frame_hold_duration_ms", 2000)
+        return 2000
+
+    @property
+    def freeze_duration_ms(self):
+        if isinstance(self.metadata_info, dict):
+            return self.metadata_info.get("freeze_duration_ms", 2000)
+        return 2000
+
     # Relationships
     track = relationship("Track", back_populates="clips")
     asset = relationship("Asset")

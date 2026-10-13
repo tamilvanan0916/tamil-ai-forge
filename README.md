@@ -7,12 +7,12 @@
 
 ## 1. Overview & Architecture
 
-TAMIL AI FORGE enables directors and creators to produce cinematic content from script to final screening. The application is built for **100% offline local operation**, requiring zero external generative AI subscriptions or cloud credentials.
+TAMIL AI FORGE enables directors and creators to produce cinematic content from script to final screening. By default, the application operates in a **local mock/demo workflow** using built-in mock providers and local FFmpeg processing, requiring zero external generative AI subscriptions or cloud credentials.
 
 ### Architectural Core Principles
-- **Offline Mock AI Pipeline**: All generative media processes utilize [`MockVideoProvider`](backend/app/providers/mock_video.py) and [`MockMediaTransformProvider`](backend/app/services/ai_media_transform.py).
+- **Offline Mock AI Pipeline**: All generative media processes utilize [`MockVideoProvider`](backend/app/providers/mock_video.py) and [`MockMediaTransformProvider`](backend/app/providers/mock_media_transform.py).
 - **Native FFmpeg / FFprobe Engine**: All video transcoding, audio waveform extraction, multi-track timeline rendering, color grading (LUTs), and technical metadata probing are executed locally via FFmpeg binaries.
-- **Zero External AI Calls**: Strict isolation from external cloud services. Zero network requests to Omni, Hugging Face ZeroGPU, Runway, Luma, Kling, ElevenLabs, OpenAI, or other third-party generative APIs.
+- **Default Local Isolation**: In default mode, all generative processes use local mock providers with zero external network requests to third-party generative APIs. Optional remote integrations require network access and configured provider credentials.
 - **Mock Transparency**: All synthetic generation cards and interfaces carry clear `OFFLINE DEMO` and `NOT REAL-PROVIDER-VERIFIED` transparency badges.
 - **Dual-Tier Storage & Persistence**: Local SQLite database with Write-Ahead Logging (`WAL` mode) and local filesystem storage with path traversal protection.
 
@@ -97,9 +97,9 @@ npm run dev -- --host 127.0.0.1 --port 5173
 
 ---
 
-## 4. Complete Filmmaking Workflow
+## 4. Complete Filmmaking Workflow & Editorial Toolset
 
-TAMIL AI FORGE follows a unified 13-stage workflow from narrative concept to final master screening:
+TAMIL AI FORGE follows a unified workflow from narrative concept to final master screening:
 
 ```
 [1. Project]        → Create/duplicate projects, configure 1920x1080 30fps Rec.709 settings
@@ -122,12 +122,22 @@ TAMIL AI FORGE follows a unified 13-stage workflow from narrative concept to fin
        ↓
 [10. Graphics & Titles] → Cinematic Titles & Motion Graphics Studio (6 Presets, Tamil Typography, Lower Thirds)
        ↓
-[11. Timeline]       → Multi-track NLE with Graphics track, snapping, split/duplicate, revisions
+[11. Timeline & NLE] → Desktop NLE timeline: ripple, roll, slip, slide, razor, 3-point/4-point, audio studio
        ↓
 [12. Render]         → Master render job with procedural drawtext title burn-in, progress tracking
        ↓
 [13. Theater & Dist] → Cinema screening player, technical spec probes (FFprobe), stem audio solo/mute
 ```
+
+### Professional NLE Editorial Capabilities (Implemented & Supported)
+- **Multi-Track Timeline**: Unlimited audio/video tracks, track locking, muting, soloing, and track destination patching.
+- **Precision Trimming & Cutting**: Razor blade tool (all tracks), head/tail clip trimming, clip splitting at playhead, duplicate/copy/paste.
+- **Advanced Trimming Tools**: Multi-track ripple editing, ripple delete with automatic gap closure, rolling edit tool across junctions, and slip & slide editing.
+- **Dual-Monitor Workspace**: Side-by-side Source Monitor and Program Monitor with In/Out marking, three-point editing, four-point editing (fit-to-fill / dynamic speed adjustment), and match frame navigation.
+- **Audio Studio & Automation**: Integrated multi-channel audio mixer, track-level volume and pan keyframe automation, dynamic VU/peak metering, and Web Audio API preview engine.
+- **Visual Keyframing & Transitions**: Transform keyframing (scale, position, opacity), freeze frame, frame hold, and transition picker (crossfades, wipes, dissolves).
+- **Timeline Navigation**: Interactive bird's-eye timeline mini-map, SMPTE timecode jump modal, zoom controls, and frame snapping.
+- **Master Native Rendering**: 1080p Full HD master export at 30 fps (Rec.709 H.264/AAC) with hardware/software encoding and real-time progress events.
 
 ---
 
@@ -150,48 +160,52 @@ uvicorn app.main:create_app --factory --host 0.0.0.0 --port 8000 --workers 4
 
 ## 6. Testing & Quality Verification
 
-TAMIL AI FORGE includes rigorous verification suites across both backend and frontend layers:
+TAMIL AI FORGE includes verification suites across backend and frontend layers. The commands below can be run in their respective directories (historical figures reflect previously reported test runs and are not freshly executed during documentation review):
 
-- **Backend Pytest Suite** (277 tests):
-  ```bash
-  cd backend
-  pytest tests/test_backend.py -q
-  ```
-- **Phase 18 Targeted Pytest Suite**:
-  ```bash
-  cd backend
-  pytest tests/test_backend.py -k "phase18" -v
-  ```
-- **TypeScript Static Verification**:
-  ```bash
-  cd frontend
-  npx tsc --noEmit
-  ```
-- **Production Bundle Test**:
-  ```bash
-  cd frontend
-  npm run build
-  ```
-- **Dependency Syntax Verification**:
-  ```bash
-  pip install --dry-run -r backend/requirements.txt
-  ```
-- **Phase 18 Graphics Studio Verification**:
-  ```bash
-  node scripts/verify_phase18_graphics.cjs
-  ```
-- **Puppeteer End-to-End Responsive Suites** (8 Viewports: 1920x1080 down to 375x812):
-  ```bash
-  node scripts/verify_phase16_puppeteer.cjs
-  node scripts/verify_phase15_puppeteer.cjs
-  node scripts/verify_phase14_puppeteer.cjs
-  ```
+### Backend Pytest Suite (Previously Reported: 1,043 Passed)
+```bash
+cd backend
+pytest -q
+```
+*Previously reported baseline: 1,043 passed tests covering core endpoints and Phase 20–50 modules (audio studio, ripple editing, razor cuts, 3-point/4-point, match frame, navigation). Historical record; not freshly re-run during documentation review.*
+
+### TypeScript Static Typecheck (Previously Reported: 0 Errors)
+```bash
+cd frontend
+npx tsc -b
+```
+*Previously reported baseline: 0 diagnostic errors.*
+
+### Frontend Production Build (Previously Reported: 1,986 Modules Transformed)
+```bash
+cd frontend
+npm run build
+```
+*Previously reported baseline: 1,986 modules transformed to static bundle.*
+
+### Real Native Render Verification (Internal Validation Script)
+```bash
+python scripts/verify_real_render_validation.py
+```
+*Internal repository validation script (must be present in the working repository; untracked in release packages). Exercises local multi-track 1080p H.264/AAC rendering and FFprobe compliance.*
 
 ---
 
-## 7. Known Boundaries & Offline Guarantees
+## 7. Operational Boundaries, AI Status & Offline Guarantees
 
-- **No External Cloud Accounts Required**: The platform is self-contained. Generating shots, performing 3D cartoon conversions, producing Tamil dubs, or overlaying cinematic titles operates locally via mock synthesis and local FFmpeg compositing.
-- **Transparency Badging**: Video and audio assets generated within the mock pipeline explicitly indicate offline demonstration status to maintain production honesty.
-- **Phase 18 Complete**: Cinematic Titles & Motion Graphics Studio is fully implemented, tested, and verified.
+### Default Local Offline Operation
+- **No External Cloud Accounts Required for Default Workflow**: The core platform runs locally out-of-the-box. Generating narrative outlines, performing 3D cartoon conversions, producing Tamil dubs, or overlaying cinematic titles operates locally via mock synthesis and local FFmpeg compositing without requiring external accounts or network access.
+- **Transparency Badging**: Video and audio assets generated within the mock pipeline explicitly indicate offline demonstration status (`OFFLINE DEMO` / `NOT REAL-PROVIDER-VERIFIED`) to maintain complete production honesty.
+
+### Remote AI Video Generation Status
+> [!IMPORTANT]
+> **Remote AI video generation is currently unverified and blocked by remote GPU availability. The previous Hugging Face ZeroGPU request failed with "No GPU was available after 60s". No real video artifact was returned from that attempt.**
+>
+> During empirical testing against the Hugging Face ZeroGPU Space (`FrameAI4687/Omni-Video-Factory`), the request timed out in the remote queue with the error message above. The remote provider did not return a video file, and no real video artifact was created or added to the project.
+
+### Operational Separation
+1. **Source-Code Implementation**: Multi-track timeline editing, audio controls, dual-monitor playback, keyframing, and local FFmpeg rendering workflows are implemented in the codebase.
+2. **Recorded Verification History**: Previously reported test suites (such as backend pytest runs and frontend builds) represent historical test records; they are not freshly re-verified during every documentation review.
+3. **Offline Demo AI Pipeline**: Default local mock providers simulate media generation workflows for local demonstration without external cloud subscriptions.
+4. **Real External Cloud AI Generation**: Unverified and currently blocked by remote GPU availability.
 

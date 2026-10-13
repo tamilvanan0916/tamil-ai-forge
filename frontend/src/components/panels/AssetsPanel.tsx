@@ -24,15 +24,33 @@ const ELEMENT_CATEGORIES = [
 
 export const AssetsPanel: React.FC = () => {
   const { activeProject, assets, fetchAssets } = useProjectStore();
-  const { timeline, addClipToTrack, playheadMs } = useTimelineStore();
+  const {
+    timeline, addClipToTrack, playheadMs, loadSourceAsset,
+    highlightedAssetId, setHighlightedAssetId,
+    findAssetTimelineOccurrences, jumpToTimelineOccurrence,
+  } = useTimelineStore();
   const { showNotification, setActiveSidebarTab } = useUIStore();
 
   const [activeCategory, setActiveCategory] = useState<AssetCategoryFilter>('all');
   const [searchQuery, setSearchQuery] = useState('');
   const [isUploading, setIsUploading] = useState(false);
   const [selectedAssetId, setSelectedAssetId] = useState<string | null>(null);
+  const [activeUsagePopoverId, setActiveUsagePopoverId] = useState<string | null>(null);
   const [addedAssetIds, setAddedAssetIds] = useState<Record<string, boolean>>({});
   const fileInputRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    if (highlightedAssetId) {
+      const el = document.getElementById(`assets-panel-item-${highlightedAssetId}`);
+      if (el) {
+        el.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+      }
+      const timer = setTimeout(() => {
+        setHighlightedAssetId(null);
+      }, 4000);
+      return () => clearTimeout(timer);
+    }
+  }, [highlightedAssetId, setHighlightedAssetId]);
 
   useEffect(() => {
     if (activeProject?.id) {
@@ -363,13 +381,22 @@ export const AssetsPanel: React.FC = () => {
             const scene = isSceneAsset(asset);
             const isAdded = addedAssetIds[asset.id];
             const meta = (asset.metadata_info || {}) as any;
+            const isHighlighted = highlightedAssetId === asset.id;
+            const occurrences = findAssetTimelineOccurrences(asset.id);
 
             return (
               <div
+                id={`assets-panel-item-${asset.id}`}
                 key={asset.id}
                 onClick={() => setSelectedAssetId(asset.id)}
-                className={`flex items-start gap-2.5 p-2 bg-cinema-850 border rounded transition-all cursor-pointer ${
-                  selectedAssetId === asset.id
+                onDoubleClick={() => {
+                  loadSourceAsset(asset);
+                  showNotification(`Opened in Source Monitor: ${asset.file_name}`, 'info');
+                }}
+                className={`flex items-start gap-2.5 p-2 bg-cinema-850 border rounded transition-all cursor-pointer relative ${
+                  isHighlighted
+                    ? 'border-amber-400 ring-2 ring-amber-400 animate-pulse bg-amber-950/30'
+                    : selectedAssetId === asset.id
                     ? 'border-cinema-ai shadow-sm bg-cinema-800'
                     : 'border-cinema-border hover:border-cinema-border/80'
                 }`}
@@ -410,17 +437,77 @@ export const AssetsPanel: React.FC = () => {
                     ) : null}
                   </div>
 
-                  {/* Metadata Specs */}
-                  <div className="flex items-center gap-2 text-[10px] text-cinema-textDim">
+                  {/* Metadata Specs & Usage Badge */}
+                  <div className="flex items-center gap-2 text-[10px] text-cinema-textDim flex-wrap relative">
                     {meta.width && meta.height && <span>{meta.width}×{meta.height}</span>}
                     {formatDuration(asset.duration_ms) && <span>{formatDuration(asset.duration_ms)}</span>}
                     {formatSize(asset.file_size_bytes) && <span>{formatSize(asset.file_size_bytes)}</span>}
                     <span className="capitalize">{asset.asset_type}</span>
+
+                    <button
+                      id={`asset-usage-badge-${asset.id}`}
+                      data-testid={`asset-usage-badge-${asset.id}`}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        if (occurrences.length > 0) {
+                          setActiveUsagePopoverId(activeUsagePopoverId === asset.id ? null : asset.id);
+                        }
+                      }}
+                      className={`px-1 py-0.2 rounded text-[8px] font-mono transition-colors ${
+                        occurrences.length > 0
+                          ? 'bg-emerald-950/80 text-emerald-300 border border-emerald-500/50 hover:bg-emerald-900/90'
+                          : 'bg-cinema-800 text-cinema-textDim border border-cinema-border/40'
+                      }`}
+                      title={occurrences.length > 0 ? `${occurrences.length} instances on timeline. Click to view.` : 'Unused'}
+                    >
+                      {occurrences.length > 0 ? `Used (${occurrences.length})` : 'Unused'}
+                    </button>
+
+                    {activeUsagePopoverId === asset.id && occurrences.length > 0 && (
+                      <div
+                        id={`asset-usage-popover-${asset.id}`}
+                        data-testid={`asset-usage-popover-${asset.id}`}
+                        className="absolute z-50 left-0 top-full mt-1 w-48 bg-cinema-900 border border-cinema-border rounded shadow-2xl p-1 text-[10px] text-cinema-text backdrop-blur-md"
+                        onClick={(e) => e.stopPropagation()}
+                      >
+                        <div className="text-[9px] text-cinema-textDim font-medium mb-1 px-1 border-b border-cinema-border/50 pb-0.5">
+                          Timeline Occurrences ({occurrences.length})
+                        </div>
+                        <div className="max-h-28 overflow-y-auto space-y-0.5">
+                          {occurrences.map((occ) => (
+                            <button
+                              key={occ.clipId}
+                              onClick={() => {
+                                jumpToTimelineOccurrence(occ.clipId);
+                                setActiveUsagePopoverId(null);
+                                showNotification(`Jumped to ${occ.trackName} at ${formatDuration(occ.startMs)}`, 'info');
+                              }}
+                              className="w-full text-left px-1.5 py-0.5 rounded bg-cinema-850 hover:bg-amber-950/70 hover:text-amber-200 transition-colors flex items-center justify-between text-[9px]"
+                            >
+                              <span className="truncate max-w-[90px] text-cinema-ai">[{occ.trackName}]</span>
+                              <span className="font-mono text-cinema-textDim">{formatDuration(occ.startMs)}</span>
+                            </button>
+                          ))}
+                        </div>
+                      </div>
+                    )}
                   </div>
                 </div>
 
                 {/* Actions */}
                 <div className="flex items-center gap-1 flex-shrink-0">
+                  <button
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      loadSourceAsset(asset);
+                      showNotification(`Opened in Source Monitor: ${asset.file_name}`, 'info');
+                    }}
+                    className="p-1.5 rounded bg-amber-500/20 hover:bg-amber-500/30 text-amber-300 border border-amber-500/40 transition-colors"
+                    title="Open in Source Monitor"
+                  >
+                    <Film className="w-3.5 h-3.5" />
+                  </button>
+
                   <button
                     onClick={(e) => {
                       e.stopPropagation();

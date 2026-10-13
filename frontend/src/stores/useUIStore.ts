@@ -23,6 +23,8 @@ interface UIStore {
   isAISettingsModalOpen: boolean;
   isThumbnailModalOpen: boolean;
   isShortsModalOpen: boolean;
+  isAIAssistantModalOpen: boolean;
+  isAudioStudioOpen: boolean;
   aiCommandPrompt: string;
   isExecutingAICommand: boolean;
   notification: { text: string; type: 'info' | 'success' | 'warning' | 'error' } | null;
@@ -38,6 +40,10 @@ interface UIStore {
   setAISettingsModalOpen: (open: boolean) => void;
   setThumbnailModalOpen: (open: boolean) => void;
   setShortsModalOpen: (open: boolean) => void;
+  setAIAssistantModalOpen: (open: boolean) => void;
+  setAudioStudioOpen: (open: boolean) => void;
+  openAudioStudio: () => void;
+  closeAudioStudio: () => void;
   setAICommandPrompt: (prompt: string) => void;
   setExecutingAICommand: (loading: boolean) => void;
   showNotification: (text: string, type?: 'info' | 'success' | 'warning' | 'error') => void;
@@ -56,6 +62,8 @@ export const useUIStore = create<UIStore>((set) => ({
   isAISettingsModalOpen: false,
   isThumbnailModalOpen: false,
   isShortsModalOpen: false,
+  isAIAssistantModalOpen: false,
+  isAudioStudioOpen: false,
   aiCommandPrompt: '',
   isExecutingAICommand: false,
   notification: null,
@@ -76,6 +84,10 @@ export const useUIStore = create<UIStore>((set) => ({
   setAISettingsModalOpen: (open: boolean) => set({ isAISettingsModalOpen: open }),
   setThumbnailModalOpen: (open: boolean) => set({ isThumbnailModalOpen: open }),
   setShortsModalOpen: (open: boolean) => set({ isShortsModalOpen: open }),
+  setAIAssistantModalOpen: (open: boolean) => set({ isAIAssistantModalOpen: open }),
+  setAudioStudioOpen: (open: boolean) => set({ isAudioStudioOpen: open }),
+  openAudioStudio: () => set({ isAudioStudioOpen: true }),
+  closeAudioStudio: () => set({ isAudioStudioOpen: false }),
 
   setAICommandPrompt: (prompt: string) => set({ aiCommandPrompt: prompt }),
   setExecutingAICommand: (loading: boolean) => set({ isExecutingAICommand: loading }),

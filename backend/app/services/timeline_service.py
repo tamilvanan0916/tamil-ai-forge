@@ -3,7 +3,9 @@ from typing import Optional, Dict, Any, List
 from sqlalchemy import select, desc
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
+from sqlalchemy.orm.attributes import flag_modified
 from app.models.timeline import Timeline, Track, Clip, Effect, Keyframe, TimelineRevision
+from app.models.project import Project
 from app.schemas.timeline import TimelineSaveRequest, GraphicsClipCreateRequest
 
 class TimelineService:
@@ -15,18 +17,57 @@ class TimelineService:
         )
         result = await db.execute(query)
         timeline = result.scalar_one_or_none()
+        if timeline:
+            project = await db.get(Project, project_id)
+            if project and project.settings:
+                timeline.markers = (project.settings or {}).get("timeline_markers", [])
+                timeline.in_point_ms = (project.settings or {}).get("timeline_in_point_ms")
+                timeline.out_point_ms = (project.settings or {}).get("timeline_out_point_ms")
+                timeline.target_video_track_id = (project.settings or {}).get("target_video_track_id")
+                timeline.target_audio_track_id = (project.settings or {}).get("target_audio_track_id")
         return timeline
 
     @staticmethod
     async def save_timeline(db: AsyncSession, project_id: str, data: TimelineSaveRequest) -> Timeline:
-        timeline = await TimelineService.get_timeline_by_project(db, project_id)
-        if not timeline:
-            timeline = Timeline(project_id=project_id, name=data.name or "Main Sequence", duration_ms=data.duration_ms)
-            db.add(timeline)
+        project = await db.get(Project, project_id)
+        if not project:
+            project = Project(
+                id=project_id,
+                title="Untitled Project",
+                settings={"width": 1920, "height": 1080, "fps": 30.0}
+            )
+            db.add(project)
             await db.flush()
 
-        # Create revision snapshot before applying modifications
-        await TimelineService.create_revision_snapshot(db, timeline.id, description="Auto-save", timeline_obj=timeline)
+        timeline = await TimelineService.get_timeline_by_project(db, project_id)
+        is_new_timeline = False
+        if not timeline:
+            timeline = Timeline(project_id=project_id, name=data.name or "Main Sequence", duration_ms=data.duration_ms)
+            timeline.tracks = []
+            db.add(timeline)
+            await db.flush()
+            is_new_timeline = True
+
+        # Save sequence markers, work area, and target track patching in project settings
+        if project:
+            settings = dict(project.settings or {})
+            if data.markers is not None:
+                settings["timeline_markers"] = [m.model_dump() if hasattr(m, 'model_dump') else dict(m) for m in data.markers]
+                timeline.markers = settings["timeline_markers"]
+            settings["timeline_in_point_ms"] = data.in_point_ms
+            settings["timeline_out_point_ms"] = data.out_point_ms
+            settings["target_video_track_id"] = getattr(data, "target_video_track_id", None)
+            settings["target_audio_track_id"] = getattr(data, "target_audio_track_id", None)
+            project.settings = settings
+            flag_modified(project, "settings")
+            timeline.in_point_ms = data.in_point_ms
+            timeline.out_point_ms = data.out_point_ms
+            timeline.target_video_track_id = getattr(data, "target_video_track_id", None)
+            timeline.target_audio_track_id = getattr(data, "target_audio_track_id", None)
+
+        # Create revision snapshot before applying modifications (only for existing timelines)
+        if not is_new_timeline and timeline.id:
+            await TimelineService.create_revision_snapshot(db, timeline.id, description="Auto-save", timeline_obj=timeline)
 
         timeline.duration_ms = data.duration_ms
         if data.name:
@@ -34,7 +75,7 @@ class TimelineService:
 
         # Sync tracks and clips
         # Delete current tracks and recreate (or update in place)
-        existing_tracks = list(timeline.tracks)
+        existing_tracks = list(timeline.tracks) if ("tracks" in getattr(timeline, "__dict__", {}) and timeline.tracks) else []
         for t in existing_tracks:
             await db.delete(t)
         await db.flush()
@@ -95,7 +136,14 @@ class TimelineService:
                     transition_out=c_spec.transition_out,
                     metadata_info={
                         **(c_spec.metadata_info or {}),
-                        **({"color_grade": c_spec.color_grade} if c_spec.color_grade else {})
+                        **({"color_grade": c_spec.color_grade} if c_spec.color_grade else {}),
+                        **({"is_frame_hold": c_spec.is_frame_hold, "frame_hold_at_ms": c_spec.frame_hold_at_ms, "frame_hold_duration_ms": c_spec.frame_hold_duration_ms} if getattr(c_spec, "is_frame_hold", False) else {}),
+                        **({"is_compound": bool(c_spec.is_compound)} if getattr(c_spec, "is_compound", False) else {}),
+                        **({"nested_tracks": [t.model_dump() if hasattr(t, 'model_dump') else dict(t) for t in c_spec.nested_tracks]} if getattr(c_spec, "nested_tracks", None) else {}),
+                        **({"markers": [m.model_dump() if hasattr(m, 'model_dump') else dict(m) for m in c_spec.markers]} if getattr(c_spec, "markers", None) else {}),
+                        **({"group_id": c_spec.group_id} if getattr(c_spec, "group_id", None) else {}),
+                        **({"linked_clip_id": c_spec.linked_clip_id} if getattr(c_spec, "linked_clip_id", None) else {}),
+                        **({"freeze_duration_ms": c_spec.freeze_duration_ms} if getattr(c_spec, "freeze_duration_ms", None) else {}),
                     },
                 )
                 db.add(clip)
@@ -144,9 +192,54 @@ class TimelineService:
     def serialize_timeline(timeline: Timeline) -> Dict[str, Any]:
         """Serializes full timeline hierarchy including tracks, clips, effects, and keyframes."""
         tracks_data = []
-        for t in (timeline.tracks or []):
+        tracks_raw = []
+        if timeline:
+            if hasattr(timeline, "__dict__") and "tracks" in timeline.__dict__:
+                tracks_raw = timeline.tracks or []
+            elif hasattr(timeline, "tracks"):
+                try:
+                    from sqlalchemy.orm import inspect as sa_inspect
+                    insp = sa_inspect(timeline)
+                    if hasattr(insp, "unloaded") and "tracks" in insp.unloaded:
+                        tracks_raw = []
+                    else:
+                        tracks_raw = timeline.tracks or []
+                except Exception:
+                    tracks_raw = getattr(timeline, "tracks", []) or []
+
+        sorted_tracks = sorted(tracks_raw, key=lambda tr: getattr(tr, 'order_index', 0))
+        for t in sorted_tracks:
             clips_data = []
-            for c in (t.clips or []):
+            clips_raw = []
+            if hasattr(t, "__dict__") and "clips" in t.__dict__:
+                clips_raw = t.clips or []
+            elif hasattr(t, "clips"):
+                try:
+                    from sqlalchemy.orm import inspect as sa_inspect
+                    insp = sa_inspect(t)
+                    if hasattr(insp, "unloaded") and "clips" in insp.unloaded:
+                        clips_raw = []
+                    else:
+                        clips_raw = t.clips or []
+                except Exception:
+                    clips_raw = getattr(t, "clips", []) or []
+
+            sorted_clips = sorted(clips_raw, key=lambda cl: getattr(cl, 'start_time_ms', 0))
+            for c in sorted_clips:
+                effects_raw = []
+                if hasattr(c, "__dict__") and "effects" in c.__dict__:
+                    effects_raw = c.effects or []
+                elif hasattr(c, "effects"):
+                    try:
+                        from sqlalchemy.orm import inspect as sa_inspect
+                        insp = sa_inspect(c)
+                        if hasattr(insp, "unloaded") and "effects" in insp.unloaded:
+                            effects_raw = []
+                        else:
+                            effects_raw = c.effects or []
+                    except Exception:
+                        effects_raw = getattr(c, "effects", []) or []
+
                 effects_data = [
                     {
                         "id": ef.id,
@@ -156,8 +249,23 @@ class TimelineService:
                         "is_enabled": ef.is_enabled,
                         "parameters": ef.parameters or {}
                     }
-                    for ef in (c.effects or [])
+                    for ef in effects_raw
                 ]
+
+                keyframes_raw = []
+                if hasattr(c, "__dict__") and "keyframes" in c.__dict__:
+                    keyframes_raw = c.keyframes or []
+                elif hasattr(c, "keyframes"):
+                    try:
+                        from sqlalchemy.orm import inspect as sa_inspect
+                        insp = sa_inspect(c)
+                        if hasattr(insp, "unloaded") and "keyframes" in insp.unloaded:
+                            keyframes_raw = []
+                        else:
+                            keyframes_raw = c.keyframes or []
+                    except Exception:
+                        keyframes_raw = getattr(c, "keyframes", []) or []
+
                 keyframes_data = [
                     {
                         "id": kf.id,
@@ -167,7 +275,7 @@ class TimelineService:
                         "interpolation": kf.interpolation,
                         "bezier_handles": kf.bezier_handles
                     }
-                    for kf in (c.keyframes or [])
+                    for kf in keyframes_raw
                 ]
                 clips_data.append({
                     "id": c.id,
@@ -183,6 +291,9 @@ class TimelineService:
                     "is_reversed": c.is_reversed,
                     "is_frozen": c.is_frozen,
                     "freeze_at_ms": c.freeze_at_ms,
+                    "is_frame_hold": bool((c.metadata_info or {}).get("is_frame_hold", False)),
+                    "frame_hold_at_ms": (c.metadata_info or {}).get("frame_hold_at_ms"),
+                    "frame_hold_duration_ms": (c.metadata_info or {}).get("frame_hold_duration_ms", 2000),
                     "opacity": c.opacity,
                     "blend_mode": c.blend_mode,
                     "position_x": c.position_x,
@@ -201,6 +312,12 @@ class TimelineService:
                     "fade_out_ms": c.fade_out_ms,
                     "transition_in": c.transition_in,
                     "transition_out": c.transition_out,
+                    "is_compound": bool((c.metadata_info or {}).get("is_compound", False)),
+                    "nested_tracks": (c.metadata_info or {}).get("nested_tracks"),
+                    "markers": (c.metadata_info or {}).get("markers", []),
+                    "group_id": (c.metadata_info or {}).get("group_id"),
+                    "linked_clip_id": (c.metadata_info or {}).get("linked_clip_id"),
+                    "freeze_duration_ms": (c.metadata_info or {}).get("freeze_duration_ms", 2000),
                     "metadata_info": c.metadata_info or {},
                     "effects": effects_data,
                     "keyframes": keyframes_data
@@ -227,7 +344,10 @@ class TimelineService:
             "project_id": timeline.project_id,
             "name": timeline.name,
             "duration_ms": timeline.duration_ms,
-            "tracks": tracks_data
+            "tracks": tracks_data,
+            "markers": getattr(timeline, "markers", []) or [],
+            "in_point_ms": getattr(timeline, "in_point_ms", None),
+            "out_point_ms": getattr(timeline, "out_point_ms", None),
         }
 
     @staticmethod
@@ -244,9 +364,9 @@ class TimelineService:
         latest = revisions[0] if revisions else None
         next_rev = (latest.revision_number + 1) if latest else 1
 
-        # Fetch timeline if not provided
+        # Fetch timeline if not provided or if relationships are not loaded
         tl = timeline_obj
-        if not tl:
+        if not tl or "tracks" not in getattr(tl, "__dict__", {}):
             tl_query = select(Timeline).where(Timeline.id == timeline_id).options(
                 selectinload(Timeline.tracks).selectinload(Track.clips).selectinload(Clip.effects),
                 selectinload(Timeline.tracks).selectinload(Track.clips).selectinload(Clip.keyframes),
@@ -318,6 +438,14 @@ class TimelineService:
         if snapshot.get("name"):
             timeline.name = snapshot["name"]
 
+        if "markers" in snapshot:
+            project = await db.get(Project, project_id)
+            if project:
+                settings = dict(project.settings or {})
+                settings["timeline_markers"] = snapshot.get("markers", [])
+                project.settings = settings
+                timeline.markers = settings["timeline_markers"]
+
         # Rebuild tracks from snapshot
         for t_data in snapshot.get("tracks", []):
             track = Track(
@@ -373,7 +501,15 @@ class TimelineService:
                     fade_out_ms=c_data.get("fade_out_ms", 0),
                     transition_in=c_data.get("transition_in"),
                     transition_out=c_data.get("transition_out"),
-                    metadata_info=c_data.get("metadata_info", {})
+                    metadata_info={
+                        **(c_data.get("metadata_info", {}) or {}),
+                        **({"is_frame_hold": c_data.get("is_frame_hold", False), "frame_hold_at_ms": c_data.get("frame_hold_at_ms"), "frame_hold_duration_ms": c_data.get("frame_hold_duration_ms", 2000)} if c_data.get("is_frame_hold") else {}),
+                        **({"is_compound": c_data.get("is_compound", False), "nested_tracks": c_data.get("nested_tracks")} if c_data.get("is_compound") else {}),
+                        **({"markers": c_data.get("markers", [])} if c_data.get("markers") else {}),
+                        **({"group_id": c_data.get("group_id")} if c_data.get("group_id") else {}),
+                        **({"linked_clip_id": c_data.get("linked_clip_id")} if c_data.get("linked_clip_id") else {}),
+                        **({"freeze_duration_ms": c_data.get("freeze_duration_ms", 2000)} if c_data.get("freeze_duration_ms") else {}),
+                    }
                 )
                 db.add(clip)
                 await db.flush()

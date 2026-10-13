@@ -10,6 +10,9 @@ class KeyframeSchema(BaseModel):
     interpolation: str = "linear"
     bezier_handles: Optional[Dict[str, Any]] = None
 
+    class Config:
+        from_attributes = True
+
 class EffectSchema(BaseModel):
     id: Optional[str] = None
     effect_type: str
@@ -17,6 +20,18 @@ class EffectSchema(BaseModel):
     order_index: int = 0
     is_enabled: bool = True
     parameters: Dict[str, Any] = {}
+
+class MarkerSchema(BaseModel):
+    id: Optional[str] = None
+    time_ms: int
+    duration_ms: Optional[int] = 0
+    name: str = "Marker"
+    comment: Optional[str] = ""
+    color: str = "blue"
+    clip_id: Optional[str] = None
+
+    class Config:
+        from_attributes = True
 
 class ClipSchema(BaseModel):
     id: Optional[str] = None
@@ -33,6 +48,10 @@ class ClipSchema(BaseModel):
     is_reversed: bool = False
     is_frozen: bool = False
     freeze_at_ms: Optional[int] = None
+    freeze_duration_ms: Optional[int] = 2000
+    is_frame_hold: bool = False
+    frame_hold_at_ms: Optional[int] = None
+    frame_hold_duration_ms: Optional[int] = 2000
     opacity: float = 1.0
     blend_mode: str = "normal"
     position_x: float = 0.5
@@ -55,6 +74,11 @@ class ClipSchema(BaseModel):
     metadata_info: Optional[Dict[str, Any]] = None
     effects: List[EffectSchema] = []
     keyframes: List[KeyframeSchema] = []
+    markers: List[MarkerSchema] = []
+    is_compound: bool = False
+    nested_tracks: Optional[List['TrackSchema']] = None
+    group_id: Optional[str] = None
+    linked_clip_id: Optional[str] = None
 
     class Config:
         from_attributes = True
@@ -62,10 +86,10 @@ class ClipSchema(BaseModel):
 class TrackSchema(BaseModel):
     id: Optional[str] = None
     timeline_id: Optional[str] = None
-    track_type: str # video, audio, subtitle, adjustment
-    track_role: str = "custom"
-    order_index: int
-    name: str
+    track_type: str = "video" # video, audio, subtitle, adjustment
+    track_role: str = "video"
+    order_index: int = 0
+    name: str = "Track"
     is_muted: bool = False
     is_locked: bool = False
     is_visible: bool = True
@@ -79,12 +103,19 @@ class TrackSchema(BaseModel):
     class Config:
         from_attributes = True
 
+ClipSchema.model_rebuild()
+
 class TimelineStateSchema(BaseModel):
     id: str
     project_id: str
     name: str = "Main Sequence"
     duration_ms: int = 0
     tracks: List[TrackSchema] = []
+    markers: List[MarkerSchema] = []
+    in_point_ms: Optional[int] = None
+    out_point_ms: Optional[int] = None
+    target_video_track_id: Optional[str] = None
+    target_audio_track_id: Optional[str] = None
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
 
@@ -95,6 +126,11 @@ class TimelineSaveRequest(BaseModel):
     name: Optional[str] = None
     duration_ms: int
     tracks: List[TrackSchema]
+    markers: Optional[List[MarkerSchema]] = []
+    in_point_ms: Optional[int] = None
+    out_point_ms: Optional[int] = None
+    target_video_track_id: Optional[str] = None
+    target_audio_track_id: Optional[str] = None
 
 class GraphicsClipCreateRequest(BaseModel):
     preset_id: str = "cinema_title"
