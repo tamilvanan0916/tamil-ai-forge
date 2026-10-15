@@ -123,6 +123,11 @@ async def lifespan(app: FastAPI):
     yield
 
     # Cleanup
+    try:
+        from app.core.ffmpeg import ffmpeg_service
+        await ffmpeg_service.shutdown(timeout=5.0)
+    except Exception:
+        pass
     await engine.dispose()
 
 def create_app() -> FastAPI:

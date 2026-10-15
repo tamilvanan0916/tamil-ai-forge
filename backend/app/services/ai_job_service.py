@@ -82,6 +82,16 @@ class AIJobService:
                         f"AI job {job_id} already in status '{job.status if job else 'missing'}', "
                         "skipping duplicate run."
                     )
+                    active_task = _active_ai_tasks.get(job_id)
+                    if active_task and active_task is not asyncio.current_task():
+                        try:
+                            await asyncio.shield(active_task)
+                        except asyncio.CancelledError:
+                            curr_t = asyncio.current_task()
+                            if curr_t and hasattr(curr_t, "cancelling") and curr_t.cancelling() > 0:
+                                raise
+                        except Exception:
+                            pass
                     return
 
                 job.status = "running"
@@ -348,16 +358,22 @@ class AIJobService:
                                         t_v.asset_id = asset_id
                                 await sc_sess.commit()
 
-                    # Generate thumbnail & proxy
-                    asyncio.create_task(ffmpeg_service.generate_thumbnail(
-                        local_dest,
-                        storage.get_local_path(f"projects/{project_id}/assets/{asset_id}/thumb.jpg"),
-                        time_sec=min(1.0, (dur_ms / 1000) / 2)
-                    ))
-                    asyncio.create_task(ffmpeg_service.generate_proxy(
-                        local_dest,
-                        storage.get_local_path(f"projects/{project_id}/assets/{asset_id}/proxy_720p.mp4")
-                    ))
+                    # Generate thumbnail & proxy (awaited to ensure process handles close cleanly)
+                    try:
+                        await asyncio.gather(
+                            ffmpeg_service.generate_thumbnail(
+                                local_dest,
+                                storage.get_local_path(f"projects/{project_id}/assets/{asset_id}/thumb.jpg"),
+                                time_sec=min(1.0, (dur_ms / 1000) / 2)
+                            ),
+                            ffmpeg_service.generate_proxy(
+                                local_dest,
+                                storage.get_local_path(f"projects/{project_id}/assets/{asset_id}/proxy_720p.mp4")
+                            ),
+                            return_exceptions=True
+                        )
+                    except Exception:
+                        pass
 
                     result_asset_id = asset_id
                     output_url = storage.get_url(storage_rel_path)
@@ -490,7 +506,9 @@ class AIJobService:
                     "error": str(exc)
                 })
             finally:
-                _active_ai_tasks.pop(job_id, None)
+                curr_t = asyncio.current_task()
+                if _active_ai_tasks.get(job_id) is curr_t:
+                    _active_ai_tasks.pop(job_id, None)
 
     @staticmethod
     async def list_jobs(db: AsyncSession, project_id: Optional[str] = None) -> List[AIJob]:

@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import os
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -438,3 +439,34 @@ class RenderService:
 
         return job
 
+    @staticmethod
+    def cleanup_orphaned_temp_files(max_age_seconds: float = 86400.0) -> int:
+        """
+        Temporary file cleanup is safely deferred.
+
+        Because database models (AIJob, RenderJob, Asset) do not record intermediate
+        scratch file paths in STORAGE_ROOT/temp, file age alone (> 24h) does not positively
+        establish orphan status (e.g. paused sessions, offline edits, or unpersisted previews).
+        To prevent unrecoverable data loss, destructive unlinking is safely deferred until
+        schema-level ownership tracking is introduced. All files are safely preserved.
+        """
+        from app.config import settings
+
+        temp_dir = Path(settings.STORAGE_ROOT) / "temp"
+        if not temp_dir.exists() or not temp_dir.is_dir():
+            return 0
+
+        # Safety Check 1: Ensure temp_dir is within resolved STORAGE_ROOT
+        storage_root_resolved = Path(settings.STORAGE_ROOT).resolve()
+        temp_dir_resolved = temp_dir.resolve()
+        try:
+            temp_dir_resolved.relative_to(storage_root_resolved)
+        except ValueError:
+            logger.error("Security violation: temp directory is outside STORAGE_ROOT. Skipping cleanup.")
+            return 0
+
+        logger.info(
+            "Temporary file cleanup is safely deferred: scratch file ownership cannot be "
+            "positively verified without schema-level tracking. Preserving all temp files."
+        )
+        return 0

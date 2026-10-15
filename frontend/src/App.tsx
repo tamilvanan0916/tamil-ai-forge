@@ -16,41 +16,23 @@ import { DynamicInspector } from './components/inspector/DynamicInspector';
 // Timeline
 import { TimelineShell } from './components/timeline/TimelineShell';
 
-// Panels - eagerly load the most common ones
+// Panels - eagerly load primary ones
 import { HomePanel } from './components/panels/HomePanel';
 import { MediaBrowserPanel } from './components/panels/MediaBrowserPanel';
 import { EditPanel } from './components/panels/EditPanel';
-import { MyProjectsPanel } from './components/panels/MyProjectsPanel';
-import { RenderQueuePanel } from './components/panels/RenderQueuePanel';
-import { SettingsPanel } from './components/panels/SettingsPanel';
-import { AssetsPanel } from './components/panels/AssetsPanel';
-import { CaptionsPanel } from './components/panels/CaptionsPanel';
-import { GraphicsPanel } from './components/panels/GraphicsPanel';
-import { MusicLibraryPanel } from './components/panels/MusicLibraryPanel';
 
-// Lazy-load heavier panels
-// Phase 6 AI Studio Panels
-import { StoryStudio } from './components/ai/StoryStudio';
-import { ProductionStudio } from './components/ai/ProductionStudio';
-import { CharacterStudio } from './components/ai/CharacterStudio';
-import { SceneStudio } from './components/ai/SceneStudio';
-import { StoryboardView } from './components/ai/StoryboardView';
-import { MediaTransformationStudio } from './components/ai/MediaTransformationStudio';
+// Lazy-load secondary panels
+const MyProjectsPanel = lazy(() => import('./components/panels/MyProjectsPanel').then(m => ({ default: m.MyProjectsPanel })));
+const RenderQueuePanel = lazy(() => import('./components/panels/RenderQueuePanel').then(m => ({ default: m.RenderQueuePanel })));
+const SettingsPanel = lazy(() => import('./components/panels/SettingsPanel').then(m => ({ default: m.SettingsPanel })));
+const AssetsPanel = lazy(() => import('./components/panels/AssetsPanel').then(m => ({ default: m.AssetsPanel })));
+const CaptionsPanel = lazy(() => import('./components/panels/CaptionsPanel').then(m => ({ default: m.CaptionsPanel })));
+const GraphicsPanel = lazy(() => import('./components/panels/GraphicsPanel').then(m => ({ default: m.GraphicsPanel })));
+const MusicLibraryPanel = lazy(() => import('./components/panels/MusicLibraryPanel').then(m => ({ default: m.MusicLibraryPanel })));
 
-// Phase 6 AI Modals
-import { AIGenerationQueue } from './components/ai/AIGenerationQueue';
-import { AISettingsModal } from './components/ai/AISettingsModal';
-import { ThumbnailStudioModal } from './components/ai/ThumbnailStudioModal';
-import { ShortsGeneratorModal } from './components/ai/ShortsGeneratorModal';
-
-// Modals
+// Modals kept statically imported for immediate access
 import { NewProjectModal } from './components/modals/NewProjectModal';
 import { ExportModal } from './components/modals/ExportModal';
-import { UnifiedProjectStatusModal } from './components/modals/UnifiedProjectStatusModal';
-import { AIEditingAssistantModal } from './components/modals/AIEditingAssistantModal';
-import { AudioStudioModal } from './components/modals/AudioStudioModal';
-import { FourPointEditModal } from './components/modals/FourPointEditModal';
-import { TimecodeJumpModal } from './components/modals/TimecodeJumpModal';
 
 // Common
 import { Notification } from './components/common/Notification';
@@ -71,30 +53,51 @@ const VoiceDubbingPanel = lazy(() => import('./components/panels/VoiceDubbingPan
 const SFXPanel = lazy(() => import('./components/panels/SFXPanel').then(m => ({ default: m.SFXPanel })));
 const TemplatesPanel = lazy(() => import('./components/panels/TemplatesPanel').then(m => ({ default: m.TemplatesPanel })));
 
+// Phase 6 AI Studio Panels (Dynamically loaded on demand)
+const StoryStudio = lazy(() => import('./components/ai/StoryStudio').then(m => ({ default: m.StoryStudio })));
+const ProductionStudio = lazy(() => import('./components/ai/ProductionStudio').then(m => ({ default: m.ProductionStudio })));
+const CharacterStudio = lazy(() => import('./components/ai/CharacterStudio').then(m => ({ default: m.CharacterStudio })));
+const SceneStudio = lazy(() => import('./components/ai/SceneStudio').then(m => ({ default: m.SceneStudio })));
+const StoryboardView = lazy(() => import('./components/ai/StoryboardView').then(m => ({ default: m.StoryboardView })));
+const MediaTransformationStudio = lazy(() => import('./components/ai/MediaTransformationStudio').then(m => ({ default: m.MediaTransformationStudio })));
+
+// Phase 6 AI Modals (Dynamically loaded on demand)
+const AIGenerationQueue = lazy(() => import('./components/ai/AIGenerationQueue').then(m => ({ default: m.AIGenerationQueue })));
+const AISettingsModal = lazy(() => import('./components/ai/AISettingsModal').then(m => ({ default: m.AISettingsModal })));
+const ThumbnailStudioModal = lazy(() => import('./components/ai/ThumbnailStudioModal').then(m => ({ default: m.ThumbnailStudioModal })));
+const ShortsGeneratorModal = lazy(() => import('./components/ai/ShortsGeneratorModal').then(m => ({ default: m.ShortsGeneratorModal })));
+
+// Heavy Editorial Modals (Dynamically loaded on demand)
+const UnifiedProjectStatusModal = lazy(() => import('./components/modals/UnifiedProjectStatusModal').then(m => ({ default: m.UnifiedProjectStatusModal })));
+const AIEditingAssistantModal = lazy(() => import('./components/modals/AIEditingAssistantModal').then(m => ({ default: m.AIEditingAssistantModal })));
+const AudioStudioModal = lazy(() => import('./components/modals/AudioStudioModal').then(m => ({ default: m.AudioStudioModal })));
+const FourPointEditModal = lazy(() => import('./components/modals/FourPointEditModal').then(m => ({ default: m.FourPointEditModal })));
+const TimecodeJumpModal = lazy(() => import('./components/modals/TimecodeJumpModal').then(m => ({ default: m.TimecodeJumpModal })));
+
 // Panel router
 const PANEL_MAP: Record<SidebarTab, React.ComponentType> = {
   'home': HomePanel,
   'media': MediaBrowserPanel,
   'ai-generate': AIGeneratePanel as React.ComponentType,
-  'media-transform': MediaTransformationStudio,
-  'production-studio': ProductionStudio,
-  'story-script': StoryStudio,
-  'characters': CharacterStudio,
-  'scenes': SceneStudio,
-  'storyboard': StoryboardView,
+  'media-transform': MediaTransformationStudio as React.ComponentType,
+  'production-studio': ProductionStudio as React.ComponentType,
+  'story-script': StoryStudio as React.ComponentType,
+  'characters': CharacterStudio as React.ComponentType,
+  'scenes': SceneStudio as React.ComponentType,
+  'storyboard': StoryboardView as React.ComponentType,
   'edit': EditPanel,
   'color': ColorPanel as React.ComponentType,
   'vfx': VFXPanel as React.ComponentType,
   'voice-dubbing': VoiceDubbingPanel as React.ComponentType,
-  'music-library': MusicLibraryPanel,
+  'music-library': MusicLibraryPanel as React.ComponentType,
   'sfx': SFXPanel as React.ComponentType,
-  'captions': CaptionsPanel,
-  'graphics': GraphicsPanel,
-  'assets': AssetsPanel,
+  'captions': CaptionsPanel as React.ComponentType,
+  'graphics': GraphicsPanel as React.ComponentType,
+  'assets': AssetsPanel as React.ComponentType,
   'templates': TemplatesPanel as React.ComponentType,
-  'my-projects': MyProjectsPanel,
-  'render-queue': RenderQueuePanel,
-  'settings': SettingsPanel,
+  'my-projects': MyProjectsPanel as React.ComponentType,
+  'render-queue': RenderQueuePanel as React.ComponentType,
+  'settings': SettingsPanel as React.ComponentType,
 };
 
 
@@ -102,6 +105,15 @@ const PanelFallback: React.FC = () => (
   <div className="flex items-center justify-center h-24 gap-2 text-cinema-textDim text-xs">
     <div className="w-4 h-4 border-2 border-cinema-ai/40 border-t-cinema-ai rounded-full animate-spin" />
     Loading…
+  </div>
+);
+
+const ModalFallback: React.FC = () => (
+  <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-xs p-4 animate-in fade-in duration-100" role="status" aria-label="Loading modal">
+    <div className="flex items-center gap-2.5 px-4 py-2.5 rounded-lg bg-cinema-900 border border-cinema-border text-cinema-text text-xs shadow-xl">
+      <div className="w-4 h-4 border-2 border-cinema-ai/40 border-t-cinema-ai rounded-full animate-spin" />
+      <span>Loading...</span>
+    </div>
   </div>
 );
 
@@ -133,6 +145,7 @@ function App() {
   const {
     fetchTimeline, togglePlay, selectedClipId, deleteClip,
     splitClipAtPlayhead, undo, redo, saveTimeline,
+    fourPointConflict, isTimecodeModalOpen,
   } = useTimelineStore();
   const { clearSelection } = useSelectionStore();
   const { showNotification } = useUIStore();
@@ -811,7 +824,11 @@ function App() {
         {/* Modals & Notifications */}
         <NewProjectModal />
         <ExportModal />
-        <FourPointEditModal />
+        {fourPointConflict && (
+          <Suspense fallback={<ModalFallback />}>
+            <FourPointEditModal />
+          </Suspense>
+        )}
         <Notification />
       </div>
     );
@@ -864,7 +881,11 @@ function App() {
 
         <NewProjectModal />
         <ExportModal />
-        <FourPointEditModal />
+        {fourPointConflict && (
+          <Suspense fallback={<ModalFallback />}>
+            <FourPointEditModal />
+          </Suspense>
+        )}
         <Notification />
       </div>
     );
@@ -923,15 +944,51 @@ function App() {
       {/* MODALS */}
       <NewProjectModal />
       <ExportModal />
-      <FourPointEditModal />
-      <TimecodeJumpModal />
-      <AIGenerationQueue isOpen={isAIQueueModalOpen} onClose={() => setAIQueueModalOpen(false)} />
-      <AISettingsModal isOpen={isAISettingsModalOpen} onClose={() => setAISettingsModalOpen(false)} />
-      <ThumbnailStudioModal isOpen={isThumbnailModalOpen} onClose={() => setThumbnailModalOpen(false)} />
-      <ShortsGeneratorModal isOpen={isShortsModalOpen} onClose={() => setShortsModalOpen(false)} />
-      <UnifiedProjectStatusModal isOpen={isProjectStatusModalOpen} onClose={() => setProjectStatusModalOpen(false)} />
-      <AIEditingAssistantModal isOpen={isAIAssistantModalOpen} onClose={() => setAIAssistantModalOpen(false)} />
-      <AudioStudioModal isOpen={isAudioStudioOpen} onClose={() => setAudioStudioOpen(false)} />
+      {fourPointConflict && (
+        <Suspense fallback={<ModalFallback />}>
+          <FourPointEditModal />
+        </Suspense>
+      )}
+      {isTimecodeModalOpen && (
+        <Suspense fallback={<ModalFallback />}>
+          <TimecodeJumpModal />
+        </Suspense>
+      )}
+      {isAIQueueModalOpen && (
+        <Suspense fallback={<ModalFallback />}>
+          <AIGenerationQueue isOpen={isAIQueueModalOpen} onClose={() => setAIQueueModalOpen(false)} />
+        </Suspense>
+      )}
+      {isAISettingsModalOpen && (
+        <Suspense fallback={<ModalFallback />}>
+          <AISettingsModal isOpen={isAISettingsModalOpen} onClose={() => setAISettingsModalOpen(false)} />
+        </Suspense>
+      )}
+      {isThumbnailModalOpen && (
+        <Suspense fallback={<ModalFallback />}>
+          <ThumbnailStudioModal isOpen={isThumbnailModalOpen} onClose={() => setThumbnailModalOpen(false)} />
+        </Suspense>
+      )}
+      {isShortsModalOpen && (
+        <Suspense fallback={<ModalFallback />}>
+          <ShortsGeneratorModal isOpen={isShortsModalOpen} onClose={() => setShortsModalOpen(false)} />
+        </Suspense>
+      )}
+      {isProjectStatusModalOpen && (
+        <Suspense fallback={<ModalFallback />}>
+          <UnifiedProjectStatusModal isOpen={isProjectStatusModalOpen} onClose={() => setProjectStatusModalOpen(false)} />
+        </Suspense>
+      )}
+      {isAIAssistantModalOpen && (
+        <Suspense fallback={<ModalFallback />}>
+          <AIEditingAssistantModal isOpen={isAIAssistantModalOpen} onClose={() => setAIAssistantModalOpen(false)} />
+        </Suspense>
+      )}
+      {isAudioStudioOpen && (
+        <Suspense fallback={<ModalFallback />}>
+          <AudioStudioModal isOpen={isAudioStudioOpen} onClose={() => setAudioStudioOpen(false)} />
+        </Suspense>
+      )}
 
       {/* TOAST NOTIFICATIONS */}
       <Notification />

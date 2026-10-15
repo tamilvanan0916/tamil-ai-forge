@@ -5,6 +5,7 @@ import math
 import os
 import re
 import subprocess
+import sys
 from pathlib import Path
 from typing import Dict, Any, Optional, List, Callable
 from app.config import settings
@@ -16,8 +17,202 @@ class FFmpegService:
     def __init__(self):
         self.ffmpeg_bin = settings.get_ffmpeg_executable()
         self.ffprobe_bin = settings.get_ffprobe_executable()
+        self._lingering_processes: Dict[int, Dict[str, Any]] = {}
+
+    @staticmethod
+    def _safe_close_transport(proc: Any) -> None:
+        """Safely closes subprocess pipe transports to release Windows IOCP / POSIX descriptors."""
+        if proc is not None:
+            transport = getattr(proc, "_transport", None)
+            if transport is not None and not getattr(transport, "_closed", False):
+                try:
+                    transport.close()
+                except Exception as exc:
+                    logger.debug("Subprocess transport close notice: %s", exc)
+
+    @staticmethod
+    def _close_proc_transport(proc: Any) -> None:
+        """Synchronous compatibility wrapper for process termination and transport closure."""
+        if proc is not None:
+            if getattr(proc, "returncode", None) is None:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+                try:
+                    underlying = getattr(getattr(proc, "_transport", None), "_proc", None)
+                    if underlying and hasattr(underlying, "poll"):
+                        underlying.poll()
+                except Exception:
+                    pass
+            FFmpegService._safe_close_transport(proc)
+
+    def _on_lingering_done(self, pid: Any, proc: Any, task: asyncio.Task) -> None:
+        """Callback attached to wait_task; handles completion and removes entry only on verified exit."""
+        try:
+            entry = self._lingering_processes.get(pid)
+            if entry is None or entry.get("wait_task") is not task or entry.get("proc") is not proc:
+                return
+
+            if task.cancelled():
+                entry["status"] = "TASK_CANCELLED_EXIT_UNCONFIRMED"
+                logger.error("Lingering wait task for PID %s was cancelled unexpectedly; exit unconfirmed.", pid)
+                return
+
+            exc = task.exception()
+            if exc is not None:
+                entry["status"] = "TASK_FAILED_EXIT_UNCONFIRMED"
+                entry["error"] = str(exc)
+                logger.error("Lingering wait task for PID %s failed: %s; exit unconfirmed.", pid, exc)
+                return
+
+            returncode = task.result()
+            if returncode is None or getattr(proc, "returncode", None) is None:
+                entry["status"] = "RETURNCODE_UNKNOWN"
+                logger.error("Lingering wait task for PID %s completed but returncode is None.", pid)
+                return
+
+            entry["status"] = "EXIT_CONFIRMED"
+            logger.info("Lingering subprocess PID %s confirmed reaped with code %s.", pid, returncode)
+            self._safe_close_transport(proc)
+            self._lingering_processes.pop(pid, None)
+
+        except Exception as cb_err:
+            logger.critical("Unexpected error in lingering process callback for PID %s: %s", pid, cb_err, exc_info=True)
+
+    async def _cleanup_proc(self, proc: Optional[Any], timeout: float = 3.0) -> None:
+        """Asynchronously terminates, reaps, or registers child processes with bounded monotonic timeout."""
+        if proc is None:
+            return
+
+        if getattr(proc, "returncode", None) is not None:
+            self._safe_close_transport(proc)
+            return
+
+        active_exc = sys.exc_info()[1]
+        pid = getattr(proc, "pid", "unknown")
+        cancellation_received = False
+        caught_cancel: Optional[asyncio.CancelledError] = None
+
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
+        except Exception as exc:
+            logger.warning("Failed to invoke proc.kill() on PID %s: %s", pid, exc)
+
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + max(0.0, timeout)
+        wait_task = asyncio.create_task(proc.wait(), name=f"ffmpeg_wait_{pid}")
+        exit_confirmed = False
+
+        try:
+            while not wait_task.done():
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    break
+                try:
+                    done, _ = await asyncio.wait(
+                        {wait_task},
+                        timeout=remaining,
+                        return_when=asyncio.FIRST_COMPLETED
+                    )
+                    if wait_task in done:
+                        exit_confirmed = True
+                        break
+                except asyncio.CancelledError as ce:
+                    cancellation_received = True
+                    caught_cancel = ce
+        finally:
+            if exit_confirmed or wait_task.done():
+                try:
+                    await wait_task
+                except Exception:
+                    pass
+                self._safe_close_transport(proc)
+            else:
+                try:
+                    entry = {
+                        "proc": proc,
+                        "wait_task": wait_task,
+                        "pid": pid,
+                        "transferred_at": loop.time(),
+                        "status": "LINGERING_MONITORED"
+                    }
+                    self._lingering_processes[pid] = entry
+                    try:
+                        wait_task.add_done_callback(lambda t: self._on_lingering_done(pid, proc, t))
+                    except Exception as cb_err:
+                        entry["status"] = "REGISTERED_CALLBACK_FAILED"
+                        logger.error("Failed to register done_callback for PID %s: %s", pid, cb_err)
+                except Exception as reg_err:
+                    logger.critical("Catastrophic failure registering lingering subprocess PID %s: %s", pid, reg_err)
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+
+        # Precedence policy: If an operational exception is actively unwinding from the caller's try
+        # block, do not raise caught_cancel from finally, as in Python raising from finally replaces
+        # the unwinding exception. If cancellation is the primary outcome, re-raise caught_cancel.
+        # Python runtime limitation: A coroutine cannot propagate two independent exceptions simultaneously.
+        if cancellation_received and caught_cancel is not None:
+            if active_exc is not None and not isinstance(active_exc, asyncio.CancelledError):
+                logger.warning(
+                    "Cancellation received during cleanup for PID %s while operational exception %s was unwinding; "
+                    "preserving operational exception per precedence policy.",
+                    pid, type(active_exc).__name__
+                )
+            else:
+                raise caught_cancel
+
+    async def shutdown(self, timeout: float = 5.0) -> None:
+        """Flushes lingering subprocesses during application shutdown within a bounded deadline."""
+        if not self._lingering_processes:
+            return
+
+        logger.info("FFmpegService shutting down with %d lingering processes.", len(self._lingering_processes))
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + max(0.0, timeout)
+
+        for entry in list(self._lingering_processes.values()):
+            try:
+                entry["proc"].kill()
+            except Exception:
+                pass
+
+        pending_tasks = [
+            entry["wait_task"] for entry in self._lingering_processes.values()
+            if not entry["wait_task"].done()
+        ]
+        if pending_tasks:
+            remaining = deadline - loop.time()
+            if remaining > 0:
+                try:
+                    await asyncio.wait(
+                        pending_tasks,
+                        timeout=remaining,
+                        return_when=asyncio.ALL_COMPLETED
+                    )
+                except Exception as exc:
+                    logger.warning("Exception while awaiting lingering tasks during shutdown: %s", exc)
+
+        for pid, entry in list(self._lingering_processes.items()):
+            proc = entry["proc"]
+            wait_task = entry["wait_task"]
+            if wait_task.done() and getattr(proc, "returncode", None) is not None:
+                self._safe_close_transport(proc)
+                self._lingering_processes.pop(pid, None)
+            else:
+                entry["status"] = "SHUTDOWN_TIMEOUT_UNRESOLVED"
+                logger.critical(
+                    "Application shutdown deadline (%ss) expired. Subprocess PID %s did NOT exit. "
+                    "Process abandoned to OS control.", timeout, pid
+                )
+                self._safe_close_transport(proc)
 
     async def _run_ffmpeg(self, cmd: List[str]) -> Dict[str, Any]:
+        proc = None
         try:
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
@@ -32,6 +227,8 @@ class FFmpegService:
             }
         except Exception as e:
             return {"returncode": -1, "stdout": "", "stderr": str(e)}
+        finally:
+            await self._cleanup_proc(proc)
 
     async def probe_media(self, file_path: Path) -> Dict[str, Any]:
         """Probes a media file and returns width, height, duration_ms, fps, codecs."""
@@ -56,6 +253,7 @@ class FFmpegService:
             str(file_path)
         ]
 
+        proc = None
         try:
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
@@ -89,16 +287,19 @@ class FFmpegService:
                 return info
         except Exception as e:
             logger.warning(f"ffprobe failed or not installed: {e}. Attempting fallback probe via ffmpeg.")
+        finally:
+            await self._cleanup_proc(proc)
 
         # Fallback: run ffmpeg -i and parse stderr
+        proc_fallback = None
         try:
             cmd = [self.ffmpeg_bin, "-i", str(file_path)]
-            proc = await asyncio.create_subprocess_exec(
+            proc_fallback = await asyncio.create_subprocess_exec(
                 *cmd,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE
             )
-            _, stderr = await proc.communicate()
+            _, stderr = await proc_fallback.communicate()
             err_text = stderr.decode("utf-8", errors="ignore")
             # Parse Duration: 00:00:05.12
             dur_match = re.search(r"Duration:\s*(\d+):(\d+):(\d+\.\d+)", err_text)
@@ -120,6 +321,8 @@ class FFmpegService:
                 info["channels"] = 2
         except Exception as e2:
             logger.error(f"Fallback probe also failed: {e2}")
+        finally:
+            await self._cleanup_proc(proc_fallback)
 
         return info
 
@@ -140,6 +343,7 @@ class FFmpegService:
             str(output_path)
         ]
 
+        proc = None
         try:
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
@@ -154,6 +358,8 @@ class FFmpegService:
         except Exception as e:
             logger.error(f"Failed to run proxy generation: {e}")
             return False
+        finally:
+            await self._cleanup_proc(proc)
 
     async def generate_thumbnail(self, source_path: Path, output_path: Path, time_sec: float = 1.0) -> bool:
         """Extracts a poster frame thumbnail."""
@@ -168,6 +374,7 @@ class FFmpegService:
             str(output_path)
         ]
 
+        proc = None
         try:
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
@@ -179,6 +386,8 @@ class FFmpegService:
         except Exception as e:
             logger.error(f"Thumbnail generation error: {e}")
             return False
+        finally:
+            await self._cleanup_proc(proc)
 
     async def extract_waveform_peaks(self, audio_path: Path, points_per_sec: int = 20) -> List[float]:
         """
@@ -193,6 +402,7 @@ class FFmpegService:
             "-"
         ]
 
+        proc = None
         try:
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
@@ -216,6 +426,8 @@ class FFmpegService:
         except Exception as e:
             logger.warning(f"Peak extraction failed: {e}")
             return [0.2, 0.5, 0.8, 0.4, 0.6, 0.9, 0.3]
+        finally:
+            await self._cleanup_proc(proc)
 
     async def trim_clip(
         self,
@@ -295,6 +507,7 @@ class FFmpegService:
 
             cmd.append(str(output_path))
 
+        proc = None
         try:
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
@@ -309,6 +522,8 @@ class FFmpegService:
         except Exception as e:
             logger.error(f"trim_clip execution error: {e}")
             return False
+        finally:
+            await self._cleanup_proc(proc)
 
     async def apply_transition(
         self,
@@ -361,6 +576,7 @@ class FFmpegService:
             str(output_path)
         ]
 
+        proc = None
         try:
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
@@ -372,6 +588,8 @@ class FFmpegService:
         except Exception as e:
             logger.error(f"apply_transition error: {e}")
             return False
+        finally:
+            await self._cleanup_proc(proc)
 
     @staticmethod
     def build_volume_automation_expression(keyframes: List[Dict[str, Any]], track_vol_db: float = 0.0) -> Optional[str]:
@@ -581,6 +799,7 @@ class FFmpegService:
                 str(output_path)
             ])
 
+        proc = None
         try:
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
@@ -592,6 +811,8 @@ class FFmpegService:
         except Exception as e:
             logger.error(f"mix_audio_tracks error: {e}")
             return False
+        finally:
+            await self._cleanup_proc(proc)
 
     @staticmethod
     def get_system_font_path(prefer_tamil: bool = True) -> Optional[str]:
@@ -1215,12 +1436,18 @@ class FFmpegService:
             str(output_path)
         ]
 
+        proc = None
+        stderr_task = None
         try:
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE
             )
+
+            # Drain stderr concurrently to prevent OS pipe buffer deadlocks
+            if proc.stderr:
+                stderr_task = asyncio.create_task(proc.stderr.read())
 
             # Read progress from stdout
             if proc.stdout:
@@ -1239,16 +1466,20 @@ class FFmpegService:
                             pass
 
             await proc.wait()
+            stderr_bytes = await stderr_task if stderr_task else b""
             if proc.returncode == 0:
                 if progress_callback:
                     await progress_callback(100.0)
                 return True
             else:
-                stderr = await proc.stderr.read() if proc.stderr else b""
-                logger.error(f"render_timeline_sequence failed: {stderr.decode('utf-8', errors='ignore')}")
+                logger.error(f"render_timeline_sequence failed: {stderr_bytes.decode('utf-8', errors='ignore')}")
                 return False
         except Exception as e:
             logger.error(f"render_timeline_sequence error: {e}")
             return False
+        finally:
+            if stderr_task and not stderr_task.done():
+                stderr_task.cancel()
+            await self._cleanup_proc(proc)
 
 ffmpeg_service = FFmpegService()
